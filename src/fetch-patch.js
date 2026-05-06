@@ -76,16 +76,21 @@ if (origFetch) {
       }))
     }
 
-    if (isWebSeed && init && init.headers) {
+    if (isWebSeed && init) {
       const stripped = {}
-      const src = init.headers
+      const src = init.headers || {}
       const entries = (typeof src.entries === 'function') ? src.entries() : Object.entries(src)
       for (const [k, v] of entries) {
         const kl = String(k).toLowerCase()
         if (kl === 'cache-control' || kl === 'user-agent') continue
         stripped[k] = v
       }
-      init = { ...init, headers: stripped }
+      // Strip `cache: 'no-store'` as well — some browser/server combos add a
+      // synthetic `Cache-Control` request header when this is set, defeating
+      // the header-strip above. The default cache mode is fine for one-shot
+      // Range fetches.
+      const { cache: _cache, ...rest } = init
+      init = { ...rest, headers: stripped }
     }
 
     if (isWebSeed) dlog('GET ' + (range ? range + ' ' : '') + url.slice(0, 110))
@@ -99,7 +104,20 @@ if (origFetch) {
         return res
       },
       (err) => {
-        if (isWebSeed) derr('throw ' + (err.message || err) + ' on ' + url.slice(0, 110))
+        if (isWebSeed) {
+          derr('throw ' + (err.message || err) + ' on ' + url.slice(0, 110))
+          // Diagnostic probe: re-fetch with the absolute minimum options so
+          // we can tell whether the URL itself is unreachable (DNS / TLS /
+          // CORS / mixed-content redirect) vs whether webconn's options are
+          // upsetting the server. Result lands in the debug panel for paste.
+          try {
+            origFetch(url, { method: 'GET', headers: { Range: range || 'bytes=0-1023' } })
+              .then(
+                (r) => dlog('probe ' + r.status + ' redirected=' + r.redirected + ' type=' + r.type + ' ← ' + url.slice(0, 100)),
+                (e) => derr('probe ALSO threw: ' + (e.message || e)),
+              )
+          } catch {}
+        }
         throw err
       },
     )

@@ -176,9 +176,17 @@ async function _doAdd(torrentId, { webSeeds = [], torrentFile = null } = {}) {
       _torrentsByHash.set(torrent.infoHash, torrent)
     })
     torrent.on('wire', (wire, addr) => {
-      const kind = wire && wire.type ? wire.type : 'peer'
-      const u = (wire && wire.url) || addr || '?'
-      dlog('wire ' + kind + ' ' + String(u).slice(0, 80))
+      // For webseeds the URL lives on the WebConn (peer.conn.url) not on the
+      // protocol Wire that 'wire' actually emits. Walk through.
+      const kind = wire?.type
+        || (wire?.peer?.type === 'webSeed' ? 'webSeed' : null)
+        || 'peer'
+      const url = wire?.url
+        || wire?.peer?.conn?.url
+        || wire?.conn?.url
+        || addr
+        || '?'
+      dlog('wire ' + kind + ' ' + String(url).slice(0, 80))
     })
     torrent.on('noPeers', (announceType) => dwarn('noPeers: ' + announceType))
     torrent.on('warning', (err) => dwarn('torrent warning: ' + (err.message || err)))
