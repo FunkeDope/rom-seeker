@@ -87,11 +87,13 @@ async function _doAdd(torrentId, { webSeeds = [], torrentFile = null } = {}) {
       //    rejects them but with a warning per torrent, noisy)
       //  - upgrade http:// → https:// for any web seed. Mixed-content is the
       //    sole reason browsers block http web seeds from an https page.
-      //  - drop IA per-CDN hosts (ia604704.us.archive.org etc.). They never
-      //    serve Access-Control-Allow-Origin so they're useless from a
-      //    browser, AND the host baked into the .torrent is often stale (IA
-      //    moves items between CDN nodes). Catalog should pin the
-      //    archive.org/cors/ endpoint instead.
+      //  - drop IA per-CDN hosts (ia604704.us.archive.org etc.) and the
+      //    /download/ endpoint. Neither sets Access-Control-Allow-Origin:
+      //    /download/ 302s to a per-CDN host, and the per-CDN response is
+      //    missing ACAO. Both are useless from a browser. The host baked
+      //    into the .torrent is also often stale (IA moves items between
+      //    CDN nodes). Catalog should pin archive.org/cors/ instead — it's
+      //    the only IA endpoint with proper CORS headers.
       try {
         const parsed = await parseTorrent(buf)
         const before = (parsed.urlList || []).slice()
@@ -102,6 +104,7 @@ async function _doAdd(torrentId, { webSeeds = [], torrentFile = null } = {}) {
           if (/^http:\/\/.+/i.test(v)) v = v.replace(/^http:/i, 'https:')
           if (!/^https:\/\/.+/i.test(v)) continue
           if (/^https:\/\/ia\d+\.us\.archive\.org\//i.test(v)) continue
+          if (/^https:\/\/archive\.org\/download\//i.test(v)) continue
           if (seen.has(v)) continue
           seen.add(v)
           cleaned.push(v)
