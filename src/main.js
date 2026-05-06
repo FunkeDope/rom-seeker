@@ -156,11 +156,15 @@ async function renderCollection(slug) {
   statusHost.innerHTML = `
     <div class="banner info" id="loading-banner">Connecting to swarm and fetching torrent metadata…</div>
   `
-  dlog('addTorrent for ' + slug)
+  // Prefer the .torrent URL when present — pulls metadata directly via HTTPS,
+  // bypassing the need to find a WebRTC peer who has the metadata to share.
+  const torrentId = entry.torrent_url || entry.magnet
+  const webSeeds = entry.web_seeds || (entry.web_seed ? [entry.web_seed] : [])
+  dlog('addTorrent for ' + slug + ' via ' + (entry.torrent_url ? 'torrent_url' : 'magnet'))
 
   let torrent
   try {
-    torrent = await addTorrent(entry.magnet)
+    torrent = await addTorrent(torrentId, { webSeeds })
     dok('torrent ready: ' + torrent.infoHash + ' files=' + torrent.files.length + ' size=' + formatSize(torrent.length))
   } catch (err) {
     derr('addTorrent failed: ' + (err.message || err))

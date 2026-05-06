@@ -34,19 +34,25 @@ export function getClient() {
 
 const _torrentsByHash = new Map()
 
-export function addTorrent(magnetOrHash) {
+export function addTorrent(torrentId, { webSeeds = [] } = {}) {
   const client = getClient()
   return new Promise((resolve, reject) => {
-    const opts = { announce: WSS_TRACKERS }
-    const existing = _findExisting(client, magnetOrHash)
+    const opts = {
+      announce: WSS_TRACKERS,
+      // BEP‑19 web seeds — IA serves these with permissive CORS, so the
+      // browser can pull pieces over HTTPS even with zero WebRTC peers.
+      urlList: webSeeds,
+    }
+    const existing = _findExisting(client, torrentId)
     if (existing) {
       if (existing.ready) return resolve(existing)
       existing.on('ready', () => resolve(existing))
       existing.on('error', reject)
       return
     }
-    dlog('client.add ' + (magnetOrHash || '').slice(0, 80))
-    const torrent = client.add(magnetOrHash, opts, (t) => {
+    dlog('client.add ' + String(torrentId).slice(0, 100))
+    if (webSeeds.length) dlog('  webSeeds=' + webSeeds.join(', '))
+    const torrent = client.add(torrentId, opts, (t) => {
       dok('torrent ready cb infoHash=' + t.infoHash + ' files=' + t.files.length)
       resolve(t)
     })
