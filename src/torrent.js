@@ -135,6 +135,7 @@ async function _doAdd(torrentId, { webSeeds = [], torrentFile = null } = {}) {
       t._romSeekerTorrentId = torrentId
       dok('torrent ready cb infoHash=' + t.infoHash + ' files=' + t.files.length +
           ' (after ' + ((Date.now() - startedAt) / 1000).toFixed(1) + 's)')
+      _attachDiagnostics(t)
       resolve(t)
     })
     torrent.on('infoHash', () => dlog('infoHash event ' + torrent.infoHash))
@@ -158,6 +159,28 @@ async function _doAdd(torrentId, { webSeeds = [], torrentFile = null } = {}) {
       reject(err)
     })
   })
+}
+
+// Periodic + event-based logging so a stuck download surfaces useful state
+// (peer count, bytes flowing, web seed activity) instead of a silent 0 B/s.
+function _attachDiagnostics(torrent) {
+  let lastDownloaded = 0
+  const tick = setInterval(() => {
+    if (torrent.destroyed) return clearInterval(tick)
+    const got = torrent.downloaded || 0
+    const delta = got - lastDownloaded
+    if (delta > 0) {
+      dlog('progress: +' + (delta / 1024).toFixed(1) + ' KB · total ' +
+        (got / 1024 / 1024).toFixed(2) + ' MB · ' +
+        ((torrent.downloadSpeed || 0) / 1024).toFixed(1) + ' KB/s · ' +
+        torrent.numPeers + ' peers')
+      lastDownloaded = got
+    }
+  }, 5000)
+  torrent.once('close', () => clearInterval(tick))
+  torrent.on('verified', (idx) => dlog('piece verified ' + idx))
+  torrent.on('verify', (idx) => dlog('verify failed for piece ' + idx))
+  torrent.on('done', () => dok('torrent done'))
 }
 
 function _findExisting(_client, magnetOrHash) {

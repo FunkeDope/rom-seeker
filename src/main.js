@@ -1,3 +1,7 @@
+// IMPORTANT: this side-effect import must come before ./torrent.js — it
+// patches self.fetch for BEP-47 padding files, and webtorrent captures
+// self.fetch at module-evaluation time.
+import './fetch-patch.js'
 import { addTorrent, downloadFile, formatSize, setSeedingEnabled, isSeedingEnabled } from './torrent.js'
 
 const SEEDING_PREF_KEY = 'rom-seeker:seeding'
