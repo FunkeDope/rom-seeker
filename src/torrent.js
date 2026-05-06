@@ -35,7 +35,34 @@ export function getClient() {
 const _torrentsByHash = new Map()
 const _addPromises = new Map() // torrentId (magnet/hash) -> Promise<Torrent>
 
-const METADATA_TIMEOUT_MS = 30_000
+const METADATA_WARN_MS = 30_000
+
+// Default-on seeding: after a download completes the tab keeps the pieces
+// selected and serves them to other browsers in the swarm. The opt-out
+// destroys completed torrents so the tab stops uploading.
+let _seedingEnabled = true
+export function isSeedingEnabled() { return _seedingEnabled }
+export function setSeedingEnabled(enabled) {
+  _seedingEnabled = !!enabled
+  dlog('seeding=' + _seedingEnabled)
+  if (!_seedingEnabled) {
+    for (const [, t] of Array.from(_torrentsByHash.entries())) {
+      // Only tear down torrents that aren't actively pulling pieces — leaving
+      // an in-flight download alone; it'll clean itself up on completion via
+      // downloadFile's end handler.
+      if (t.progress >= 1 || (t.downloadSpeed || 0) < 1024) _destroyTorrent(t)
+    }
+  }
+}
+
+function _destroyTorrent(torrent) {
+  const hash = torrent.infoHash
+  const id = torrent._romSeekerTorrentId
+  try { torrent.destroy() } catch {}
+  if (hash) _torrentsByHash.delete(hash)
+  if (id) _addPromises.delete(id)
+  dlog('destroyed torrent ' + (hash || id || '?'))
+}
 
 export function addTorrent(torrentId, opts = {}) {
   if (_addPromises.has(torrentId)) return _addPromises.get(torrentId)
@@ -46,13 +73,35 @@ export function addTorrent(torrentId, opts = {}) {
   return p
 }
 
-function _doAdd(torrentId, { webSeeds = [] } = {}) {
+async function _doAdd(torrentId, { webSeeds = [], torrentFile = null } = {}) {
   const client = getClient()
+
+  // Genesis path: fetch the .torrent file ourselves (metadata only, ~50 KB)
+  // and hand the bytes to WebTorrent. This sidesteps the chicken-and-egg of
+  // "browser needs metadata to peer, but can only get metadata from a peer."
+  // The actual data still rides the swarm — the .torrent file is just the
+  // file list + piece hashes. WebTorrent in the browser can't fetch HTTP
+  // .torrent URLs itself (Node-only feature), so we do it here.
+  let addArg = torrentId
+  if (torrentFile) {
+    try {
+      dlog('fetching .torrent ' + torrentFile)
+      const res = await fetch(torrentFile, { cache: 'force-cache' })
+      if (!res.ok) throw new Error('HTTP ' + res.status)
+      const buf = new Uint8Array(await res.arrayBuffer())
+      dok('.torrent fetched: ' + buf.byteLength + ' bytes')
+      addArg = buf
+    } catch (err) {
+      dwarn('.torrent fetch failed (' + (err.message || err) + '); falling back to magnet')
+    }
+  }
+
   return new Promise((resolve, reject) => {
     const opts = {
       announce: WSS_TRACKERS,
-      // BEP‑19 web seeds — IA serves these with permissive CORS, so the
-      // browser can pull pieces over HTTPS even with zero WebRTC peers.
+      // BEP-19 web seeds — IA serves these with permissive CORS, so the
+      // browser can pull pieces over HTTPS as a bootstrap until other browser
+      // peers join the swarm.
       urlList: webSeeds,
     }
     const existing = _findExisting(client, torrentId)
@@ -62,28 +111,39 @@ function _doAdd(torrentId, { webSeeds = [] } = {}) {
       existing.on('error', reject)
       return
     }
-    dlog('client.add ' + String(torrentId).slice(0, 100))
+    const argDesc = addArg instanceof Uint8Array
+      ? '<.torrent ' + addArg.byteLength + 'B>'
+      : String(addArg).slice(0, 100)
+    dlog('client.add ' + argDesc)
     if (webSeeds.length) dlog('  webSeeds=' + webSeeds.join(', '))
     const startedAt = Date.now()
     let settled = false
 
-    const timer = setTimeout(() => {
+    // Soft warning instead of a hard reject: late peers (or a slow .torrent
+    // mirror) shouldn't tear down the whole add(). The page stays alive and
+    // can still pick up peers and pieces whenever they show up.
+    const warnTimer = setTimeout(() => {
       if (settled) return
       const peers = torrent.numPeers || 0
-      derr('metadata timeout after ' + METADATA_TIMEOUT_MS / 1000 + 's; peers=' + peers +
-           ' (no WebRTC seeders found via WSS trackers)')
-    }, METADATA_TIMEOUT_MS)
+      dwarn('still waiting for metadata after ' + METADATA_WARN_MS / 1000 + 's; peers=' + peers +
+            ' (will keep listening for late peers and web seeds)')
+    }, METADATA_WARN_MS)
 
-    const torrent = client.add(torrentId, opts, (t) => {
+    const torrent = client.add(addArg, opts, (t) => {
       settled = true
-      clearTimeout(timer)
+      clearTimeout(warnTimer)
+      t._romSeekerTorrentId = torrentId
       dok('torrent ready cb infoHash=' + t.infoHash + ' files=' + t.files.length +
           ' (after ' + ((Date.now() - startedAt) / 1000).toFixed(1) + 's)')
       resolve(t)
     })
     torrent.on('infoHash', () => dlog('infoHash event ' + torrent.infoHash))
     torrent.on('metadata', () => {
-      dlog('metadata event; deselecting all files')
+      // Deselect everything so prefetch doesn't trigger a multi-GB download.
+      // Files become "selected" only when the user clicks a row — and they
+      // *stay* selected after the download completes, which is what keeps
+      // the tab seeding pieces to other browsers in the swarm.
+      dlog('metadata event; deselecting all (download is opt-in per file)')
       torrent.deselect(0, torrent.pieces.length - 1, false)
       for (const f of torrent.files) f.deselect()
       _torrentsByHash.set(torrent.infoHash, torrent)
@@ -93,7 +153,7 @@ function _doAdd(torrentId, { webSeeds = [] } = {}) {
     torrent.on('warning', (err) => dwarn('torrent warning: ' + (err.message || err)))
     torrent.on('error', (err) => {
       settled = true
-      clearTimeout(timer)
+      clearTimeout(warnTimer)
       derr('torrent error: ' + (err.message || err))
       reject(err)
     })
@@ -160,6 +220,9 @@ export function downloadFile(torrent, file, onProgress) {
           try { await writer.close() } catch {}
           tickProgress()
           onProgress && onProgress({ progress: 1, downloaded: file.length, done: true })
+          // Honor the user's seeding preference: opt-out destroys the torrent
+          // now that they have what they came for.
+          if (!_seedingEnabled) _destroyTorrent(torrent)
         }
       })
       stream.on('error', async (err) => {

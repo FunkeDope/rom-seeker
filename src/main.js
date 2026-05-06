@@ -1,4 +1,6 @@
-import { addTorrent, downloadFile, formatSize } from './torrent.js'
+import { addTorrent, downloadFile, formatSize, setSeedingEnabled, isSeedingEnabled } from './torrent.js'
+
+const SEEDING_PREF_KEY = 'rom-seeker:seeding'
 
 const dlog = (m) => window.dlog && window.dlog(m)
 const dok = (m) => window.dok && window.dok(m)
@@ -40,10 +42,11 @@ function prefetchCatalog(entries) {
   if (_prefetched) return
   _prefetched = true
   for (const entry of entries) {
-    if (!entry.magnet) continue
+    if (!entry.magnet && !entry.torrent_file) continue
     const webSeeds = entry.web_seeds || (entry.web_seed ? [entry.web_seed] : [])
+    const torrentFile = entry.torrent_file || null
     dlog('prefetch ' + entry.slug)
-    addTorrent(entry.magnet, { webSeeds }).then(
+    addTorrent(entry.magnet || entry.torrent_file, { webSeeds, torrentFile }).then(
       (t) => dok('prefetch ' + entry.slug + ' ready: files=' + t.files.length),
       (err) => dwarn('prefetch ' + entry.slug + ' failed: ' + (err.message || err)),
     )
@@ -179,11 +182,12 @@ async function renderCollection(slug) {
     <div class="banner info" id="loading-banner">Connecting to swarm and fetching torrent metadata…</div>
   `
   const webSeeds = entry.web_seeds || (entry.web_seed ? [entry.web_seed] : [])
-  dlog('addTorrent for ' + slug)
+  const torrentFile = entry.torrent_file || null
+  dlog('addTorrent for ' + slug + (torrentFile ? ' (.torrent + magnet)' : ' (magnet)'))
 
   let torrent
   try {
-    torrent = await addTorrent(entry.magnet, { webSeeds })
+    torrent = await addTorrent(entry.magnet || entry.torrent_file, { webSeeds, torrentFile })
     dok('torrent ready: ' + torrent.infoHash + ' files=' + torrent.files.length + ' size=' + formatSize(torrent.length))
   } catch (err) {
     derr('addTorrent failed: ' + (err.message || err))
@@ -310,7 +314,7 @@ function renderRows(table) {
       state.progressCell = progressCell
       applyRowState(file, state)
     } else if (file.done) {
-      progressCell.textContent = 'done'
+      renderDoneCell(progressCell)
       tr.classList.add('done')
     }
 
@@ -361,7 +365,7 @@ function onRowClick(file, row, progressCell) {
     newState.progress = progress
     if (done) {
       newState.status = 'done'
-      progressCell.textContent = 'done'
+      renderDoneCell(progressCell)
       row.classList.remove('downloading')
       row.classList.add('done')
     } else {
@@ -375,6 +379,18 @@ function renderProgress(cell, fraction) {
   cell.innerHTML = `<span class="bar"><span style="width:${pct.toFixed(1)}%"></span></span><span class="pct">${pct.toFixed(0)}%</span>`
 }
 
+function renderDoneCell(cell) {
+  // Distinguish "done and seeding to other browsers" from "done, opted out
+  // of seeding". The peer count is the most honest signal that the swarm is
+  // real and the user is contributing to it.
+  if (!isSeedingEnabled()) {
+    cell.textContent = 'done'
+    return
+  }
+  const peers = currentTorrent ? (currentTorrent.numPeers || 0) : 0
+  cell.innerHTML = `<span class="seeding-dot"></span>seeding · ${peers} peer${peers === 1 ? '' : 's'}`
+}
+
 function applyRowState(file, state) {
   const { row, progressCell, status, progress } = state
   if (status === 'downloading') {
@@ -382,7 +398,7 @@ function applyRowState(file, state) {
     renderProgress(progressCell, progress || file.progress || 0)
   } else if (status === 'done') {
     row.classList.add('done')
-    progressCell.textContent = 'done'
+    renderDoneCell(progressCell)
   } else if (status === 'error') {
     progressCell.textContent = 'error'
   } else if (status === 'cancelled') {
@@ -391,12 +407,17 @@ function applyRowState(file, state) {
 }
 
 function updateActiveRows() {
-  // Walk currentFiles; if a file has an active state, refresh its progress text.
+  // Walk currentFiles; refresh per-file progress text, and refresh the
+  // "seeding · N peers" cell on done rows so the peer count stays live.
   for (const file of currentFiles) {
     const state = activeRowState.get(file)
-    if (!state || state.status !== 'downloading' || !state.progressCell) continue
-    state.progress = file.progress
-    renderProgress(state.progressCell, file.progress)
+    if (!state || !state.progressCell) continue
+    if (state.status === 'downloading') {
+      state.progress = file.progress
+      renderProgress(state.progressCell, file.progress)
+    } else if (state.status === 'done') {
+      renderDoneCell(state.progressCell)
+    }
   }
 }
 
@@ -428,4 +449,25 @@ function route() {
 }
 
 window.addEventListener('hashchange', route)
+
+// ---------- Seeding toggle ----------
+
+function initSeedingToggle() {
+  // Restore preference (default ON).
+  try {
+    const saved = localStorage.getItem(SEEDING_PREF_KEY)
+    if (saved === 'false') setSeedingEnabled(false)
+  } catch {}
+  const cb = document.getElementById('seed-toggle')
+  if (!cb) return
+  cb.checked = isSeedingEnabled()
+  cb.addEventListener('change', () => {
+    setSeedingEnabled(cb.checked)
+    try { localStorage.setItem(SEEDING_PREF_KEY, String(cb.checked)) } catch {}
+    // Refresh visible "seeding · N peers" indicators immediately.
+    updateActiveRows()
+  })
+}
+
+initSeedingToggle()
 route()
