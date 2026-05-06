@@ -82,22 +82,42 @@ async function _doAdd(torrentId, { webSeeds = [], torrentFile = null } = {}) {
       dok('.torrent fetched: ' + buf.byteLength + ' bytes')
 
       // Pre-parse so we can scrub the urlList before webtorrent ingests it.
-      // The .torrent's embedded url-list mixes useful HTTPS web seeds with
-      // http:// CDN URLs (mixed content, browsers block) and broken relative
-      // entries like "/1/items/". WebTorrent's piece queue does NOT load-
-      // balance away from a doomed wire — it round-robins, hits the bad
-      // wire, fails, the wire gets a 10s timeout, repeat. Stripping the
-      // non-https entries up-front leaves only working web seeds.
+      // Two transformations:
+      //  - drop garbage entries (relative paths like "/1/items/" — webtorrent
+      //    rejects them but with a warning per torrent, noisy)
+      //  - upgrade http:// → https:// for any web seed. Mixed-content is the
+      //    sole reason browsers block http web seeds from an https page; the
+      //    underlying host nearly always serves HTTPS too. Worth a try, and
+      //    crucially this gives us a CDN-direct URL for hosts that
+      //    /download/-style endpoints would otherwise 302-redirect to (often
+      //    breaking CORS along the way).
       try {
         const parsed = await parseTorrent(buf)
         const before = (parsed.urlList || []).slice()
-        parsed.urlList = (parsed.urlList || []).filter((u) => /^https:\/\/.+/i.test(u))
-        // Append any caller-supplied web seeds (also https-only).
-        for (const u of webSeeds) {
-          if (/^https:\/\/.+/i.test(u) && !parsed.urlList.includes(u)) parsed.urlList.push(u)
+        const seen = new Set()
+        const cleaned = []
+        for (const u of before) {
+          let v = u
+          if (/^http:\/\/.+/i.test(v)) v = v.replace(/^http:/i, 'https:')
+          if (!/^https:\/\/.+/i.test(v)) continue
+          if (seen.has(v)) continue
+          seen.add(v)
+          cleaned.push(v)
         }
-        const dropped = before.filter((u) => !parsed.urlList.includes(u))
-        if (dropped.length) dlog('dropped ' + dropped.length + ' non-https web seed(s): ' + dropped.join(', '))
+        for (const u of webSeeds) {
+          let v = u
+          if (/^http:\/\/.+/i.test(v)) v = v.replace(/^http:/i, 'https:')
+          if (/^https:\/\/.+/i.test(v) && !seen.has(v)) { seen.add(v); cleaned.push(v) }
+        }
+        parsed.urlList = cleaned
+        const dropped = before.filter((u) => {
+          const v = /^http:\/\/.+/i.test(u) ? u.replace(/^http:/i, 'https:') : u
+          return !cleaned.includes(v)
+        })
+        const upgraded = before.filter((u) => /^http:\/\/.+/i.test(u))
+        if (dropped.length) dlog('dropped non-http(s) web seed(s): ' + dropped.join(', '))
+        if (upgraded.length) dlog('http→https upgraded ' + upgraded.length + ' web seed(s)')
+        dlog('final urlList: ' + cleaned.join(', '))
         addArg = parsed
         pieceCount = parsed.pieces ? parsed.pieces.length : 0
       } catch (err) {
