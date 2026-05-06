@@ -5,6 +5,47 @@
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>rom-seeker — browser-based ROM index</title>
     <link rel="stylesheet" href="/src/style.css" />
+    <!-- Inline fallback CSS so the page is readable even if /src/style.css fails. -->
+    <style>
+      body { margin: 0; font: 14px/1.5 -apple-system, "Segoe UI", Roboto, Arial, sans-serif; background: #f6f7f8; color: #1f2328; }
+      .wrap { max-width: 1100px; margin: 0 auto; padding: 0 16px; }
+      .site-header { background: #fff; border-bottom: 1px solid #e3e6ea; padding: 12px 0; }
+      .site-footer { margin-top: 40px; padding: 16px 0; border-top: 1px solid #e3e6ea; color: #6b7077; font-size: 12px; }
+      a { color: #2d7d7d; text-decoration: none; }
+      .brand { font-weight: 700; color: #1f2328; }
+
+      /* Debug panel — always visible, self-contained styling. */
+      #debug {
+        position: relative;
+        margin: 12px auto 0;
+        max-width: 1100px;
+        padding: 10px 14px;
+        background: #0c0f12;
+        color: #c9d1d9;
+        border: 1px solid #30363d;
+        border-radius: 6px;
+        font: 12px/1.45 ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+        max-height: 240px;
+        overflow: auto;
+        box-sizing: border-box;
+      }
+      #debug header {
+        display: flex; justify-content: space-between; align-items: center;
+        font-weight: 600; color: #58a6ff; margin-bottom: 6px;
+      }
+      #debug header button {
+        background: #21262d; color: #c9d1d9; border: 1px solid #30363d;
+        border-radius: 4px; padding: 2px 8px; font-size: 11px; cursor: pointer;
+      }
+      #debug ol { margin: 0; padding: 0; list-style: none; }
+      #debug li { padding: 2px 0; border-bottom: 1px dashed #21262d; word-break: break-word; }
+      #debug li:last-child { border-bottom: none; }
+      #debug .ts { color: #6e7681; margin-right: 8px; }
+      #debug .lvl-info { color: #c9d1d9; }
+      #debug .lvl-ok { color: #3fb950; }
+      #debug .lvl-warn { color: #d29922; }
+      #debug .lvl-err { color: #ff7b72; }
+    </style>
   </head>
   <body>
     <header class="site-header">
@@ -15,6 +56,11 @@
       </div>
     </header>
 
+    <section id="debug" aria-live="polite">
+      <header><span>debug</span><button type="button" id="debug-clear">clear</button></header>
+      <ol id="debug-log"></ol>
+    </section>
+
     <main class="wrap" id="view"></main>
 
     <footer class="site-footer">
@@ -22,6 +68,59 @@
         <span>peer-to-peer in your browser via <a href="https://webtorrent.io/" target="_blank" rel="noopener">WebTorrent</a>. files come straight from the swarm + Internet Archive web seeds; nothing is hosted here.</span>
       </div>
     </footer>
+
+    <!-- Inline early-boot diagnostics: must run BEFORE the bundled module so we
+         capture any errors that prevent it from loading at all. -->
+    <script>
+      (function () {
+        var log = document.getElementById('debug-log');
+        function ts() {
+          var d = new Date();
+          return d.toISOString().slice(11, 23);
+        }
+        function write(level, msg) {
+          if (!log) return;
+          var li = document.createElement('li');
+          li.innerHTML =
+            '<span class="ts">' + ts() + '</span>' +
+            '<span class="lvl-' + level + '">' + String(msg).replace(/[<>&]/g, function (c) {
+              return { '<': '&lt;', '>': '&gt;', '&': '&amp;' }[c];
+            }) + '</span>';
+          log.appendChild(li);
+          li.scrollIntoView({ block: 'end' });
+        }
+        window.dlog = function (msg) { write('info', msg); };
+        window.dok   = function (msg) { write('ok', msg); };
+        window.dwarn = function (msg) { write('warn', msg); };
+        window.derr  = function (msg) { write('err', msg); };
+
+        document.getElementById('debug-clear').addEventListener('click', function () {
+          log.innerHTML = '';
+        });
+
+        window.addEventListener('error', function (e) {
+          write('err', 'window error: ' + (e.message || e.error || e));
+          if (e.filename) write('err', '  at ' + e.filename + ':' + e.lineno);
+        });
+        window.addEventListener('unhandledrejection', function (e) {
+          var r = e.reason;
+          write('err', 'unhandled rejection: ' + (r && (r.message || r.toString()) || r));
+        });
+
+        window.dlog('boot @ ' + location.href);
+        window.dlog('UA ' + navigator.userAgent);
+        window.dlog('webrtc=' + (typeof RTCPeerConnection !== 'undefined') +
+                    ' sw=' + ('serviceWorker' in navigator) +
+                    ' ws=' + (typeof WebSocket !== 'undefined'));
+
+        // Probe the styled CSS — if 404, we know the build wasn't deployed.
+        var probe = location.pathname.replace(/\/[^/]*$/, '/') + 'src/style.css';
+        fetch(probe, { method: 'HEAD' }).then(function (r) {
+          if (r.ok) window.dok('css /src/style.css responded ' + r.status);
+          else window.dwarn('css /src/style.css HEAD ' + r.status + ' (expected if running the built bundle)');
+        }).catch(function (e) { window.dwarn('css HEAD failed: ' + e.message); });
+      })();
+    </script>
 
     <script type="module" src="/src/main.js"></script>
   </body>

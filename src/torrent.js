@@ -1,6 +1,13 @@
 import WebTorrent from 'webtorrent/dist/webtorrent.min.js'
 import streamSaver from 'streamsaver'
 
+const dlog = (m) => window.dlog && window.dlog('[wt] ' + m)
+const dok = (m) => window.dok && window.dok('[wt] ' + m)
+const dwarn = (m) => window.dwarn && window.dwarn('[wt] ' + m)
+const derr = (m) => window.derr && window.derr('[wt] ' + m)
+
+dok('torrent.js loaded; WebTorrent type=' + (typeof WebTorrent))
+
 // Public WSS trackers — added to every torrent so browser peers can find each other
 // even when the magnet's own announce list is HTTP/UDP-only (typical of IA torrents).
 export const WSS_TRACKERS = [
@@ -12,8 +19,15 @@ export const WSS_TRACKERS = [
 let _client = null
 export function getClient() {
   if (!_client) {
-    _client = new WebTorrent()
-    _client.on('error', (err) => console.warn('[webtorrent] client error:', err.message || err))
+    try {
+      _client = new WebTorrent()
+      dok('client created; WEBRTC_SUPPORT=' + WebTorrent.WEBRTC_SUPPORT)
+    } catch (err) {
+      derr('client init failed: ' + (err.message || err))
+      throw err
+    }
+    _client.on('error', (err) => derr('client error: ' + (err.message || err)))
+    _client.on('warning', (err) => dwarn('client warning: ' + (err.message || err)))
   }
   return _client
 }
@@ -31,19 +45,23 @@ export function addTorrent(magnetOrHash) {
       existing.on('error', reject)
       return
     }
+    dlog('client.add ' + (magnetOrHash || '').slice(0, 80))
     const torrent = client.add(magnetOrHash, opts, (t) => {
-      // selection happens below in 'metadata'
+      dok('torrent ready cb infoHash=' + t.infoHash + ' files=' + t.files.length)
       resolve(t)
     })
+    torrent.on('infoHash', () => dlog('infoHash event ' + torrent.infoHash))
     torrent.on('metadata', () => {
-      // Deselect everything by default — we only want files the user clicks.
-      // WebTorrent auto-selects all files on add; we override that here.
+      dlog('metadata event; deselecting all files')
       torrent.deselect(0, torrent.pieces.length - 1, false)
       for (const f of torrent.files) f.deselect()
       _torrentsByHash.set(torrent.infoHash, torrent)
     })
+    torrent.on('wire', (wire, addr) => dlog('wire ' + (addr || '?')))
+    torrent.on('noPeers', (announceType) => dwarn('noPeers: ' + announceType))
+    torrent.on('warning', (err) => dwarn('torrent warning: ' + (err.message || err)))
     torrent.on('error', (err) => {
-      console.warn('[webtorrent] torrent error:', err.message || err)
+      derr('torrent error: ' + (err.message || err))
       reject(err)
     })
   })

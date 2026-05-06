@@ -1,5 +1,12 @@
 import { addTorrent, downloadFile, formatSize } from './torrent.js'
 
+const dlog = (m) => window.dlog && window.dlog(m)
+const dok = (m) => window.dok && window.dok(m)
+const dwarn = (m) => window.dwarn && window.dwarn(m)
+const derr = (m) => window.derr && window.derr(m)
+
+dok('main.js module loaded')
+
 const view = document.getElementById('view')
 const crumbs = document.getElementById('crumbs')
 const filterInput = document.getElementById('filter')
@@ -9,11 +16,15 @@ let currentFilter = ''
 
 async function loadCatalog() {
   if (catalog.length) return catalog
-  // Vite serves files in /public at the deployed base path.
   const url = `${import.meta.env.BASE_URL}catalog.json`
+  dlog('GET ' + url)
   const res = await fetch(url)
-  if (!res.ok) throw new Error(`failed to load catalog.json: ${res.status}`)
+  if (!res.ok) {
+    derr('catalog HTTP ' + res.status)
+    throw new Error(`failed to load catalog.json: ${res.status}`)
+  }
   catalog = await res.json()
+  dok('catalog loaded: ' + catalog.length + ' entries')
   return catalog
 }
 
@@ -145,11 +156,14 @@ async function renderCollection(slug) {
   statusHost.innerHTML = `
     <div class="banner info" id="loading-banner">Connecting to swarm and fetching torrent metadata…</div>
   `
+  dlog('addTorrent for ' + slug)
 
   let torrent
   try {
     torrent = await addTorrent(entry.magnet)
+    dok('torrent ready: ' + torrent.infoHash + ' files=' + torrent.files.length + ' size=' + formatSize(torrent.length))
   } catch (err) {
+    derr('addTorrent failed: ' + (err.message || err))
     statusHost.innerHTML = `<div class="banner error">Failed to add torrent: ${escapeHtml(err.message || String(err))}</div>`
     return
   }
@@ -380,12 +394,13 @@ function escapeAttr(s) { return escapeHtml(s).replace(/'/g, '&#39;') }
 
 function route() {
   const hash = location.hash || '#/'
+  dlog('route ' + hash)
   const m = /^#\/c\/([^/]+)\/?$/.exec(hash)
   if (m) {
-    renderCollection(decodeURIComponent(m[1]))
+    renderCollection(decodeURIComponent(m[1])).catch((e) => derr('renderCollection threw: ' + (e.message || e)))
   } else {
     clearViewState()
-    renderLanding()
+    renderLanding().catch((e) => derr('renderLanding threw: ' + (e.message || e)))
   }
 }
 
