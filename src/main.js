@@ -28,7 +28,26 @@ async function loadCatalog() {
   catalog = await res.json()
   dok('catalog loaded: ' + catalog.length + ' entries; first slug=' + (catalog[0] && catalog[0].slug) +
       ' magnet=' + (catalog[0] && catalog[0].magnet ? 'set' : 'empty'))
+  prefetchCatalog(catalog)
   return catalog
+}
+
+// Fire off addTorrent for every entry that has a magnet, in parallel, the
+// instant the catalog loads. addTorrent dedupes by torrentId so the later
+// per-collection navigation reuses the same in-flight Promise.
+let _prefetched = false
+function prefetchCatalog(entries) {
+  if (_prefetched) return
+  _prefetched = true
+  for (const entry of entries) {
+    if (!entry.magnet) continue
+    const webSeeds = entry.web_seeds || (entry.web_seed ? [entry.web_seed] : [])
+    dlog('prefetch ' + entry.slug)
+    addTorrent(entry.magnet, { webSeeds }).then(
+      (t) => dok('prefetch ' + entry.slug + ' ready: files=' + t.files.length),
+      (err) => dwarn('prefetch ' + entry.slug + ' failed: ' + (err.message || err)),
+    )
+  }
 }
 
 function setCrumbs(parts) {

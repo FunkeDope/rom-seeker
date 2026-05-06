@@ -33,10 +33,20 @@ export function getClient() {
 }
 
 const _torrentsByHash = new Map()
+const _addPromises = new Map() // torrentId (magnet/hash) -> Promise<Torrent>
 
 const METADATA_TIMEOUT_MS = 30_000
 
-export function addTorrent(torrentId, { webSeeds = [] } = {}) {
+export function addTorrent(torrentId, opts = {}) {
+  if (_addPromises.has(torrentId)) return _addPromises.get(torrentId)
+  const p = _doAdd(torrentId, opts)
+  _addPromises.set(torrentId, p)
+  // If the add fails, drop the cached promise so a retry can happen.
+  p.catch(() => _addPromises.delete(torrentId))
+  return p
+}
+
+function _doAdd(torrentId, { webSeeds = [] } = {}) {
   const client = getClient()
   return new Promise((resolve, reject) => {
     const opts = {
