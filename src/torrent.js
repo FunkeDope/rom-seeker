@@ -90,13 +90,16 @@ export function addTorrent(torrentId, { webSeeds = [] } = {}) {
   })
 }
 
-function _findExisting(client, magnetOrHash) {
-  // try infoHash extracted from magnet, or treat input as a hash directly
-  const m = /xt=urn:btih:([0-9a-f]{40}|[A-Z2-7]{32})/i.exec(magnetOrHash || '')
+function _findExisting(_client, magnetOrHash) {
+  // Look up by infoHash in our own map. WebTorrent v2's client.get() is
+  // async (returns a Promise), so we can't use it synchronously here.
+  // Hex hashes only — base32 magnets get parsed inside WebTorrent itself,
+  // and a duplicate add will be caught by client.add()'s _infoHash check.
+  const m = /xt=urn:btih:([0-9a-f]{40})/i.exec(magnetOrHash || '')
   let hash = m ? m[1].toLowerCase() : null
   if (!hash && /^[0-9a-f]{40}$/i.test(magnetOrHash || '')) hash = magnetOrHash.toLowerCase()
   if (!hash) return null
-  return client.get(hash) || null
+  return _torrentsByHash.get(hash) || null
 }
 
 /**

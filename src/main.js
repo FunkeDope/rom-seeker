@@ -16,15 +16,18 @@ let currentFilter = ''
 
 async function loadCatalog() {
   if (catalog.length) return catalog
-  const url = `${import.meta.env.BASE_URL}catalog.json`
+  // GitHub Pages doesn't fingerprint static files in /public, and mobile
+  // browsers cache aggressively — bust both with a timestamp + no-store.
+  const url = `${import.meta.env.BASE_URL}catalog.json?v=${Date.now()}`
   dlog('GET ' + url)
-  const res = await fetch(url)
+  const res = await fetch(url, { cache: 'no-store' })
   if (!res.ok) {
     derr('catalog HTTP ' + res.status)
     throw new Error(`failed to load catalog.json: ${res.status}`)
   }
   catalog = await res.json()
-  dok('catalog loaded: ' + catalog.length + ' entries')
+  dok('catalog loaded: ' + catalog.length + ' entries; first slug=' + (catalog[0] && catalog[0].slug) +
+      ' magnet=' + (catalog[0] && catalog[0].magnet ? 'set' : 'empty'))
   return catalog
 }
 
