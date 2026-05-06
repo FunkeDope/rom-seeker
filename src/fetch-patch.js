@@ -104,88 +104,10 @@ if (origFetch) {
         return res
       },
       (err) => {
-        if (isWebSeed) {
-          derr('throw ' + (err.message || err) + ' on ' + url.slice(0, 110))
-          // Diagnostic probe: re-fetch with the absolute minimum options so
-          // we can tell whether the URL itself is unreachable (DNS / TLS /
-          // CORS / mixed-content redirect) vs whether webconn's options are
-          // upsetting the server. Result lands in the debug panel for paste.
-          try {
-            origFetch(url, { method: 'GET', headers: { Range: range || 'bytes=0-1023' } })
-              .then(
-                (r) => dlog('probe ' + r.status + ' redirected=' + r.redirected + ' type=' + r.type + ' ← ' + url.slice(0, 100)),
-                (e) => derr('probe ALSO threw: ' + (e.message || e)),
-              )
-          } catch {}
-        }
+        if (isWebSeed) derr('throw ' + (err.message || err) + ' on ' + url.slice(0, 110))
         throw err
       },
     )
   }
   dlog('patch installed (BEP-47 padding + CORS preflight strip + webseed logging)')
-}
-
-// One-shot connectivity diagnostic. We've already established that
-// /download/ and the .torrent's hard-coded ia904704 host both throw —
-// even with mode:'no-cors' on ia904704, which means that host is unreachable
-// at a layer below CORS (either no HTTPS, or it redirects to http://).
-//
-// The metadata API works though, and its response includes the current CDN
-// server — which may not be ia904704 anymore (IA moves items around). Probe
-// the live server, plus a couple of other documented IA URL patterns.
-async function _runConnectivityProbes() {
-  const small = { headers: { Range: 'bytes=0-1023' } }
-  const tests = [
-    ['cors-endpoint   ', 'https://archive.org/cors/mame251/3b1.zip', small],
-    ['download-norange', 'https://archive.org/download/mame251/3b1.zip', {}],
-  ]
-  dlog('[probe] starting connectivity matrix...')
-  for (const [label, url, opts] of tests) {
-    try {
-      const res = await origFetch(url, opts)
-      try { res.body && res.body.cancel && res.body.cancel() } catch {}
-      const cors = res.headers && res.headers.get && res.headers.get('access-control-allow-origin')
-      dlog('[probe ' + label + '] ' + res.status +
-        ' redir=' + (res.redirected ? 'Y' : 'N') +
-        ' type=' + res.type +
-        (cors ? ' acao=' + cors : ''))
-    } catch (e) {
-      derr('[probe ' + label + '] THREW: ' + (e.message || e))
-    }
-  }
-
-  // Discover the *current* CDN server for the item via the (working)
-  // metadata API, then probe a CDN-direct URL on that server.
-  try {
-    const r = await origFetch('https://archive.org/metadata/mame251')
-    if (!r.ok) throw new Error('HTTP ' + r.status)
-    const meta = await r.json()
-    const server = meta.d1 || meta.server
-    const dir = meta.dir
-    dlog('[probe] metadata says server=' + server + ' dir=' + dir)
-    if (server && dir) {
-      const liveUrl = 'https://' + server + dir + '/3b1.zip'
-      try {
-        const res = await origFetch(liveUrl, small)
-        try { res.body && res.body.cancel && res.body.cancel() } catch {}
-        const cors = res.headers && res.headers.get && res.headers.get('access-control-allow-origin')
-        dlog('[probe live-cdn      ] ' + res.status +
-          ' redir=' + (res.redirected ? 'Y' : 'N') +
-          ' type=' + res.type +
-          (cors ? ' acao=' + cors : '') +
-          ' ← ' + liveUrl)
-      } catch (e) {
-        derr('[probe live-cdn      ] THREW: ' + (e.message || e) + ' on ' + liveUrl)
-      }
-    }
-  } catch (e) {
-    derr('[probe live-cdn      ] metadata fetch failed: ' + (e.message || e))
-  }
-
-  dlog('[probe] done')
-}
-
-if (origFetch) {
-  // Run after page boot so we don't compete with the .torrent fetch.
-  setTimeout(() => _runConnectivityProbes(), 500)
 }
