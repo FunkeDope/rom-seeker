@@ -1,4 +1,5 @@
 import WebTorrent from 'webtorrent/dist/webtorrent.min.js'
+import parseTorrent from 'parse-torrent'
 import { getTorrentState, markSelected, markDeselected, markDone, isDone } from './storage.js'
 
 const dlog = (m) => window.dlog && window.dlog('[wt] ' + m)
@@ -79,8 +80,31 @@ async function _doAdd(torrentId, { webSeeds = [], torrentFile = null } = {}) {
       if (!res.ok) throw new Error('HTTP ' + res.status)
       const buf = new Uint8Array(await res.arrayBuffer())
       dok('.torrent fetched: ' + buf.byteLength + ' bytes')
-      addArg = buf
-      pieceCount = _piecesCountFromTorrent(buf)
+
+      // Pre-parse so we can scrub the urlList before webtorrent ingests it.
+      // The .torrent's embedded url-list mixes useful HTTPS web seeds with
+      // http:// CDN URLs (mixed content, browsers block) and broken relative
+      // entries like "/1/items/". WebTorrent's piece queue does NOT load-
+      // balance away from a doomed wire — it round-robins, hits the bad
+      // wire, fails, the wire gets a 10s timeout, repeat. Stripping the
+      // non-https entries up-front leaves only working web seeds.
+      try {
+        const parsed = await parseTorrent(buf)
+        const before = (parsed.urlList || []).slice()
+        parsed.urlList = (parsed.urlList || []).filter((u) => /^https:\/\/.+/i.test(u))
+        // Append any caller-supplied web seeds (also https-only).
+        for (const u of webSeeds) {
+          if (/^https:\/\/.+/i.test(u) && !parsed.urlList.includes(u)) parsed.urlList.push(u)
+        }
+        const dropped = before.filter((u) => !parsed.urlList.includes(u))
+        if (dropped.length) dlog('dropped ' + dropped.length + ' non-https web seed(s): ' + dropped.join(', '))
+        addArg = parsed
+        pieceCount = parsed.pieces ? parsed.pieces.length : 0
+      } catch (err) {
+        dwarn('parse-torrent failed (' + (err.message || err) + '); using raw bytes')
+        addArg = buf
+        pieceCount = _piecesCountFromTorrent(buf)
+      }
       if (pieceCount) dlog('parsed pieces=' + pieceCount)
     } catch (err) {
       dwarn('.torrent fetch failed (' + (err.message || err) + '); falling back to magnet')
@@ -90,7 +114,11 @@ async function _doAdd(torrentId, { webSeeds = [], torrentFile = null } = {}) {
   return new Promise((resolve, reject) => {
     const opts = {
       announce: WSS_TRACKERS,
-      urlList: webSeeds,
+      // urlList isn't needed when we pre-parsed: we baked the cleaned list
+      // into the parsed object's urlList field above. Set empty to avoid
+      // webtorrent re-adding caller-supplied URLs that didn't survive the
+      // https filter.
+      urlList: addArg === torrentId ? webSeeds : [],
       // Start with no pieces selected. Multi-GB catalog torrents would
       // otherwise auto-download in full; the user opts in per file.
       deselect: true,
@@ -116,9 +144,12 @@ async function _doAdd(torrentId, { webSeeds = [], torrentFile = null } = {}) {
     }
     const argDesc = addArg instanceof Uint8Array
       ? '<.torrent ' + addArg.byteLength + 'B>'
-      : String(addArg).slice(0, 100)
+      : (addArg && addArg.infoHash)
+        ? '<parsed ' + addArg.infoHash.slice(0, 8) + ' ' + (addArg.urlList?.length || 0) + ' webseeds>'
+        : String(addArg).slice(0, 100)
     dlog('client.add ' + argDesc)
-    if (webSeeds.length) dlog('  webSeeds=' + webSeeds.join(', '))
+    if (addArg && addArg.urlList && addArg.urlList.length) dlog('  webSeeds=' + addArg.urlList.join(', '))
+    else if (webSeeds.length) dlog('  webSeeds=' + webSeeds.join(', '))
     const startedAt = Date.now()
     let settled = false
 
