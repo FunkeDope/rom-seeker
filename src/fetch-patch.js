@@ -125,23 +125,19 @@ if (origFetch) {
   dlog('patch installed (BEP-47 padding + CORS preflight strip + webseed logging)')
 }
 
-// One-shot connectivity diagnostic. Cross-origin "Failed to fetch" hides the
-// real cause behind that one opaque error string; this runs a small matrix
-// of fetches on boot and logs the outcome of each so we can tell whether
-// archive.org is reachable at all from this browser/network, whether the
-// CORS-friendly metadata API works (rules out network/DNS issues), whether
-// /download/ redirects break things vs CDN-direct URLs, and whether the
-// Range header itself is the trigger.
+// One-shot connectivity diagnostic. We've already established that
+// /download/ and the .torrent's hard-coded ia904704 host both throw —
+// even with mode:'no-cors' on ia904704, which means that host is unreachable
+// at a layer below CORS (either no HTTPS, or it redirects to http://).
 //
-// Each probe uses a tiny Range so even a "success" only transfers ~1 KB.
+// The metadata API works though, and its response includes the current CDN
+// server — which may not be ia904704 anymore (IA moves items around). Probe
+// the live server, plus a couple of other documented IA URL patterns.
 async function _runConnectivityProbes() {
   const small = { headers: { Range: 'bytes=0-1023' } }
   const tests = [
-    ['metadata-api  ', 'https://archive.org/metadata/mame251', {}],
-    ['download-range', 'https://archive.org/download/mame251/3b1.zip', small],
-    ['cdn-range     ', 'https://ia904704.us.archive.org/1/items/mame251/3b1.zip', small],
-    ['cdn-no-cors   ', 'https://ia904704.us.archive.org/1/items/mame251/3b1.zip',
-      { ...small, mode: 'no-cors' }],
+    ['cors-endpoint   ', 'https://archive.org/cors/mame251/3b1.zip', small],
+    ['download-norange', 'https://archive.org/download/mame251/3b1.zip', {}],
   ]
   dlog('[probe] starting connectivity matrix...')
   for (const [label, url, opts] of tests) {
@@ -157,6 +153,35 @@ async function _runConnectivityProbes() {
       derr('[probe ' + label + '] THREW: ' + (e.message || e))
     }
   }
+
+  // Discover the *current* CDN server for the item via the (working)
+  // metadata API, then probe a CDN-direct URL on that server.
+  try {
+    const r = await origFetch('https://archive.org/metadata/mame251')
+    if (!r.ok) throw new Error('HTTP ' + r.status)
+    const meta = await r.json()
+    const server = meta.d1 || meta.server
+    const dir = meta.dir
+    dlog('[probe] metadata says server=' + server + ' dir=' + dir)
+    if (server && dir) {
+      const liveUrl = 'https://' + server + dir + '/3b1.zip'
+      try {
+        const res = await origFetch(liveUrl, small)
+        try { res.body && res.body.cancel && res.body.cancel() } catch {}
+        const cors = res.headers && res.headers.get && res.headers.get('access-control-allow-origin')
+        dlog('[probe live-cdn      ] ' + res.status +
+          ' redir=' + (res.redirected ? 'Y' : 'N') +
+          ' type=' + res.type +
+          (cors ? ' acao=' + cors : '') +
+          ' ← ' + liveUrl)
+      } catch (e) {
+        derr('[probe live-cdn      ] THREW: ' + (e.message || e) + ' on ' + liveUrl)
+      }
+    }
+  } catch (e) {
+    derr('[probe live-cdn      ] metadata fetch failed: ' + (e.message || e))
+  }
+
   dlog('[probe] done')
 }
 
