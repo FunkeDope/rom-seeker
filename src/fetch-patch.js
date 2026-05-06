@@ -124,3 +124,43 @@ if (origFetch) {
   }
   dlog('patch installed (BEP-47 padding + CORS preflight strip + webseed logging)')
 }
+
+// One-shot connectivity diagnostic. Cross-origin "Failed to fetch" hides the
+// real cause behind that one opaque error string; this runs a small matrix
+// of fetches on boot and logs the outcome of each so we can tell whether
+// archive.org is reachable at all from this browser/network, whether the
+// CORS-friendly metadata API works (rules out network/DNS issues), whether
+// /download/ redirects break things vs CDN-direct URLs, and whether the
+// Range header itself is the trigger.
+//
+// Each probe uses a tiny Range so even a "success" only transfers ~1 KB.
+async function _runConnectivityProbes() {
+  const small = { headers: { Range: 'bytes=0-1023' } }
+  const tests = [
+    ['metadata-api  ', 'https://archive.org/metadata/mame251', {}],
+    ['download-range', 'https://archive.org/download/mame251/3b1.zip', small],
+    ['cdn-range     ', 'https://ia904704.us.archive.org/1/items/mame251/3b1.zip', small],
+    ['cdn-no-cors   ', 'https://ia904704.us.archive.org/1/items/mame251/3b1.zip',
+      { ...small, mode: 'no-cors' }],
+  ]
+  dlog('[probe] starting connectivity matrix...')
+  for (const [label, url, opts] of tests) {
+    try {
+      const res = await origFetch(url, opts)
+      try { res.body && res.body.cancel && res.body.cancel() } catch {}
+      const cors = res.headers && res.headers.get && res.headers.get('access-control-allow-origin')
+      dlog('[probe ' + label + '] ' + res.status +
+        ' redir=' + (res.redirected ? 'Y' : 'N') +
+        ' type=' + res.type +
+        (cors ? ' acao=' + cors : ''))
+    } catch (e) {
+      derr('[probe ' + label + '] THREW: ' + (e.message || e))
+    }
+  }
+  dlog('[probe] done')
+}
+
+if (origFetch) {
+  // Run after page boot so we don't compete with the .torrent fetch.
+  setTimeout(() => _runConnectivityProbes(), 500)
+}
