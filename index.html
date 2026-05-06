@@ -1,0 +1,28 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>rom-seeker — browser-based ROM index</title>
+    <link rel="stylesheet" href="/src/style.css" />
+  </head>
+  <body>
+    <header class="site-header">
+      <div class="wrap">
+        <a class="brand" href="#/">rom-seeker</a>
+        <nav class="crumbs" id="crumbs"></nav>
+        <input class="filter" id="filter" type="search" placeholder="filter…" autocomplete="off" />
+      </div>
+    </header>
+
+    <main class="wrap" id="view"></main>
+
+    <footer class="site-footer">
+      <div class="wrap">
+        <span>peer-to-peer in your browser via <a href="https://webtorrent.io/" target="_blank" rel="noopener">WebTorrent</a>. files come straight from the swarm + Internet Archive web seeds; nothing is hosted here.</span>
+      </div>
+    </footer>
+
+    <script type="module" src="/src/main.js"></script>
+  </body>
+</html>

@@ -1,0 +1,18 @@
+{
+  "name": "rom-seeker",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "preview": "vite preview"
+  },
+  "dependencies": {
+    "streamsaver": "^2.0.6",
+    "webtorrent": "^2.5.1"
+  },
+  "devDependencies": {
+    "vite": "^5.4.10"
+  }
+}

@@ -1,0 +1,16 @@
+[
+  {
+    "slug": "mame",
+    "title": "MAME — Arcade ROMs",
+    "subtitle": "Multiple Arcade Machine Emulator collection",
+    "magnet": "",
+    "source": "https://archive.org/"
+  },
+  {
+    "slug": "psx",
+    "title": "Sony — PlayStation",
+    "subtitle": "PSX / PS1 ROM collection",
+    "magnet": "",
+    "source": "https://archive.org/"
+  }
+]
