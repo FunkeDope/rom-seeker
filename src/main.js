@@ -156,11 +156,9 @@ async function renderCollection(slug) {
   statusHost.innerHTML = `
     <div class="banner info" id="loading-banner">Connecting to swarm and fetching torrent metadata…</div>
   `
-  // Prefer the .torrent URL when present — pulls metadata directly via HTTPS,
-  // bypassing the need to find a WebRTC peer who has the metadata to share.
-  const torrentId = entry.torrent_url || entry.magnet
+  const torrentId = entry.magnet || entry.torrent_url
   const webSeeds = entry.web_seeds || (entry.web_seed ? [entry.web_seed] : [])
-  dlog('addTorrent for ' + slug + ' via ' + (entry.torrent_url ? 'torrent_url' : 'magnet'))
+  dlog('addTorrent for ' + slug + ' via ' + (entry.magnet ? 'magnet' : 'torrent_url'))
 
   let torrent
   try {

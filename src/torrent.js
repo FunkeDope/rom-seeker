@@ -34,6 +34,8 @@ export function getClient() {
 
 const _torrentsByHash = new Map()
 
+const METADATA_TIMEOUT_MS = 30_000
+
 export function addTorrent(torrentId, { webSeeds = [] } = {}) {
   const client = getClient()
   return new Promise((resolve, reject) => {
@@ -52,8 +54,21 @@ export function addTorrent(torrentId, { webSeeds = [] } = {}) {
     }
     dlog('client.add ' + String(torrentId).slice(0, 100))
     if (webSeeds.length) dlog('  webSeeds=' + webSeeds.join(', '))
+    const startedAt = Date.now()
+    let settled = false
+
+    const timer = setTimeout(() => {
+      if (settled) return
+      const peers = torrent.numPeers || 0
+      derr('metadata timeout after ' + METADATA_TIMEOUT_MS / 1000 + 's; peers=' + peers +
+           ' (no WebRTC seeders found via WSS trackers; magnet alone cannot fetch metadata in browser)')
+    }, METADATA_TIMEOUT_MS)
+
     const torrent = client.add(torrentId, opts, (t) => {
-      dok('torrent ready cb infoHash=' + t.infoHash + ' files=' + t.files.length)
+      settled = true
+      clearTimeout(timer)
+      dok('torrent ready cb infoHash=' + t.infoHash + ' files=' + t.files.length +
+          ' (after ' + ((Date.now() - startedAt) / 1000).toFixed(1) + 's)')
       resolve(t)
     })
     torrent.on('infoHash', () => dlog('infoHash event ' + torrent.infoHash))
@@ -67,6 +82,8 @@ export function addTorrent(torrentId, { webSeeds = [] } = {}) {
     torrent.on('noPeers', (announceType) => dwarn('noPeers: ' + announceType))
     torrent.on('warning', (err) => dwarn('torrent warning: ' + (err.message || err)))
     torrent.on('error', (err) => {
+      settled = true
+      clearTimeout(timer)
       derr('torrent error: ' + (err.message || err))
       reject(err)
     })
