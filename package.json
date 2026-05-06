@@ -10,7 +10,6 @@
     "fetch-torrents": "node scripts/fetch-torrents.mjs"
   },
   "dependencies": {
-    "streamsaver": "^2.0.6",
     "webtorrent": "^2.5.1"
   },
   "devDependencies": {

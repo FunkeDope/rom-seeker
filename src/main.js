@@ -1,22 +1,16 @@
 // IMPORTANT: this side-effect import must come before ./torrent.js — it
-// patches self.fetch for BEP-47 padding files, and webtorrent captures
-// self.fetch at module-evaluation time.
+// patches self.fetch for BEP-47 padding files and CORS-preflight headers,
+// and webtorrent captures self.fetch at module-evaluation time.
 import './fetch-patch.js'
-import { addTorrent, downloadFile, formatSize, setSeedingEnabled, isSeedingEnabled } from './torrent.js'
+import {
+  addTorrent, downloadFile, formatSize,
+  setSeedingEnabled, isSeedingEnabled,
+  getGlobalStats, getClient,
+} from './torrent.js'
+import { getTorrentState } from './storage.js'
 
 const SEEDING_PREF_KEY = 'rom-seeker:seeding'
-
-// Resolve a catalog `torrent_file` field into an absolute fetch URL. Local
-// relative paths (the default — bundled in /public/torrents/) become
-// same-origin URLs under BASE_URL, sidestepping the cross-origin CORS gap on
-// archive.org's synthesized .torrent files. Absolute URLs are returned as-is
-// for cases where a remote fetch happens to work.
-function resolveTorrentFile(entry) {
-  const t = entry.torrent_file
-  if (!t) return null
-  if (/^https?:/i.test(t)) return t
-  return `${import.meta.env.BASE_URL}${t}`
-}
+const PAGE_SIZE = 100
 
 const dlog = (m) => window.dlog && window.dlog(m)
 const dok = (m) => window.dok && window.dok(m)
@@ -32,10 +26,15 @@ const filterInput = document.getElementById('filter')
 let catalog = []
 let currentFilter = ''
 
+function resolveTorrentFile(entry) {
+  const t = entry.torrent_file
+  if (!t) return null
+  if (/^https?:/i.test(t)) return t
+  return `${import.meta.env.BASE_URL}${t}`
+}
+
 async function loadCatalog() {
   if (catalog.length) return catalog
-  // GitHub Pages doesn't fingerprint static files in /public, and mobile
-  // browsers cache aggressively — bust both with a timestamp + no-store.
   const url = `${import.meta.env.BASE_URL}catalog.json?v=${Date.now()}`
   dlog('GET ' + url)
   const res = await fetch(url, { cache: 'no-store' })
@@ -44,15 +43,11 @@ async function loadCatalog() {
     throw new Error(`failed to load catalog.json: ${res.status}`)
   }
   catalog = await res.json()
-  dok('catalog loaded: ' + catalog.length + ' entries; first slug=' + (catalog[0] && catalog[0].slug) +
-      ' magnet=' + (catalog[0] && catalog[0].magnet ? 'set' : 'empty'))
+  dok('catalog loaded: ' + catalog.length + ' entries')
   prefetchCatalog(catalog)
   return catalog
 }
 
-// Fire off addTorrent for every entry that has a magnet, in parallel, the
-// instant the catalog loads. addTorrent dedupes by torrentId so the later
-// per-collection navigation reuses the same in-flight Promise.
 let _prefetched = false
 function prefetchCatalog(entries) {
   if (_prefetched) return
@@ -139,10 +134,12 @@ async function renderLanding() {
 // ---------- File index page ----------
 
 const PROGRESS_REFRESH_MS = 500
-let activeRowState = new WeakMap() // file -> { row, progressCell, handle, status }
+let activeRowState = new WeakMap() // file -> { row, progressCell, handle, status, progress }
 let currentTorrent = null
 let currentFiles = []
 let currentSort = { key: 'name', dir: 1 }
+let currentStatusFilter = 'all' // 'all' | 'selected' | 'done'
+let currentPage = 0
 let progressTimer = null
 
 function clearViewState() {
@@ -150,6 +147,8 @@ function clearViewState() {
   activeRowState = new WeakMap()
   currentTorrent = null
   currentFiles = []
+  currentPage = 0
+  currentStatusFilter = 'all'
 }
 
 async function renderCollection(slug) {
@@ -178,17 +177,19 @@ async function renderCollection(slug) {
     <h1 class="page-title">${escapeHtml(entry.title)}</h1>
     <p class="page-sub">${escapeHtml(entry.subtitle || '')}${entry.source ? ` · <a href="${escapeAttr(entry.source)}" target="_blank" rel="noopener">source</a>` : ''}</p>
     <div id="status-host"></div>
+    <div id="toolbar-host"></div>
     <div id="table-host"></div>
+    <div id="pager-host"></div>
   `
   const statusHost = view.querySelector('#status-host')
+  const toolbarHost = view.querySelector('#toolbar-host')
   const tableHost = view.querySelector('#table-host')
+  const pagerHost = view.querySelector('#pager-host')
 
-  if (!entry.magnet) {
+  if (!entry.magnet && !entry.torrent_file) {
     statusHost.innerHTML = `
       <div class="banner warn">
-        No magnet link is configured for <strong>${escapeHtml(entry.title)}</strong> yet.
-        Add one to <code class="placeholder-magnet">public/catalog.json</code> for the
-        <code class="placeholder-magnet">${escapeHtml(slug)}</code> entry.
+        No torrent is configured for <strong>${escapeHtml(entry.title)}</strong> yet.
       </div>
     `
     return
@@ -214,17 +215,38 @@ async function renderCollection(slug) {
   currentTorrent = torrent
   currentFiles = torrent.files.slice()
 
-  renderStatusBar(statusHost, torrent)
-  renderTable(tableHost)
+  renderPerTorrentStatus(statusHost, torrent)
+  renderToolbar(toolbarHost)
 
-  // Periodic updates for swarm stats and per-file progress
+  // Re-arm the UI handles for any selections persisted from a previous
+  // session BEFORE rendering the table — so renderRows picks up the
+  // activeRowState entries and shows mid-download files as downloading.
+  // The torrent itself was already re-selected by _restoreSelections() in
+  // torrent.js; this only attaches save-on-done handlers + UI state.
+  rearmRestoredSelections()
+
+  renderTable(tableHost, pagerHost)
+
   progressTimer = setInterval(() => {
-    updateStatusBar(statusHost, torrent)
+    updatePerTorrentStatus(statusHost, torrent)
     updateActiveRows()
   }, PROGRESS_REFRESH_MS)
 }
 
-function renderStatusBar(host, torrent) {
+function rearmRestoredSelections() {
+  if (!currentTorrent) return
+  const state = getTorrentState(currentTorrent.infoHash)
+  const doneSet = new Set(state.done)
+  for (const path of state.selected) {
+    if (doneSet.has(path)) continue
+    const file = currentFiles.find((f) => f.path === path || f.name === path)
+    if (!file || file.done) continue
+    if (activeRowState.has(file)) continue
+    _startFileDownload(file, /* visible row may not exist yet */ null, null)
+  }
+}
+
+function renderPerTorrentStatus(host, torrent) {
   host.innerHTML = ''
   const bar = document.createElement('div')
   bar.className = 'status-bar'
@@ -235,10 +257,10 @@ function renderStatusBar(host, torrent) {
     <span class="rate"></span>
   `
   host.appendChild(bar)
-  updateStatusBar(host, torrent)
+  updatePerTorrentStatus(host, torrent)
 }
 
-function updateStatusBar(host, torrent) {
+function updatePerTorrentStatus(host, torrent) {
   const bar = host.querySelector('.status-bar')
   if (!bar) return
   const peers = torrent.numPeers || 0
@@ -249,7 +271,61 @@ function updateStatusBar(host, torrent) {
   bar.querySelector('.rate').textContent = `· ↓ ${formatSize(torrent.downloadSpeed)}/s`
 }
 
-function renderTable(host) {
+function renderToolbar(host) {
+  host.innerHTML = `
+    <div class="toolbar">
+      <label class="status-filter">
+        Show:
+        <select id="status-filter-select">
+          <option value="all">all files</option>
+          <option value="selected">downloading / queued</option>
+          <option value="done">done</option>
+        </select>
+      </label>
+      <span class="toolbar-meta" id="toolbar-meta"></span>
+    </div>
+  `
+  const sel = host.querySelector('#status-filter-select')
+  sel.value = currentStatusFilter
+  sel.addEventListener('change', () => {
+    currentStatusFilter = sel.value
+    currentPage = 0
+    const tableHost = view.querySelector('#table-host')
+    const pagerHost = view.querySelector('#pager-host')
+    renderTable(tableHost, pagerHost)
+  })
+}
+
+function applyFilter(files) {
+  let result = files
+  const text = currentFilter.toLowerCase()
+  if (text) result = result.filter((f) => f.name.toLowerCase().includes(text))
+  if (currentStatusFilter === 'selected') {
+    const state = currentTorrent ? getTorrentState(currentTorrent.infoHash) : { selected: [], done: [] }
+    const sel = new Set(state.selected)
+    const dn = new Set(state.done)
+    result = result.filter((f) => sel.has(f.path) && !dn.has(f.path))
+  } else if (currentStatusFilter === 'done') {
+    const state = currentTorrent ? getTorrentState(currentTorrent.infoHash) : { selected: [], done: [] }
+    const dn = new Set(state.done)
+    result = result.filter((f) => f.done || dn.has(f.path))
+  }
+  return result
+}
+
+function applySort(files) {
+  const sorted = files.slice()
+  sorted.sort((a, b) => {
+    let cmp = 0
+    if (currentSort.key === 'size') cmp = a.length - b.length
+    else if (currentSort.key === 'progress') cmp = (a.progress || 0) - (b.progress || 0)
+    else cmp = a.name.localeCompare(b.name, undefined, { numeric: true, sensitivity: 'base' })
+    return cmp * currentSort.dir
+  })
+  return sorted
+}
+
+function renderTable(host, pagerHost) {
   const table = document.createElement('table')
   table.className = 'file-table'
   table.innerHTML = `
@@ -257,7 +333,7 @@ function renderTable(host) {
       <tr>
         <th class="col-name" data-sort="name">Name <span class="arrow">▲</span></th>
         <th class="col-size" data-sort="size">Size <span class="arrow">▲</span></th>
-        <th class="col-progress">Progress</th>
+        <th class="col-progress" data-sort="progress">Progress <span class="arrow">▲</span></th>
       </tr>
     </thead>
     <tbody></tbody>
@@ -270,18 +346,18 @@ function renderTable(host) {
       const key = th.dataset.sort
       if (currentSort.key === key) currentSort.dir *= -1
       else { currentSort.key = key; currentSort.dir = 1 }
-      renderRows(table)
+      currentPage = 0
+      renderRows(table, pagerHost)
     })
   })
 
-  renderRows(table)
+  renderRows(table, pagerHost)
 }
 
-function renderRows(table) {
+function renderRows(table, pagerHost) {
   const tbody = table.querySelector('tbody')
   tbody.innerHTML = ''
 
-  // Update header sort indicators
   table.querySelectorAll('thead th').forEach((th) => {
     th.classList.remove('sorted')
     const arrow = th.querySelector('.arrow')
@@ -292,26 +368,30 @@ function renderRows(table) {
     }
   })
 
-  const filter = currentFilter.toLowerCase()
-  const filtered = filter
-    ? currentFiles.filter((f) => f.name.toLowerCase().includes(filter))
-    : currentFiles.slice()
+  const filtered = applyFilter(currentFiles)
+  const sorted = applySort(filtered)
 
-  filtered.sort((a, b) => {
-    let cmp = 0
-    if (currentSort.key === 'size') cmp = a.length - b.length
-    else cmp = a.name.localeCompare(b.name, undefined, { numeric: true, sensitivity: 'base' })
-    return cmp * currentSort.dir
-  })
+  // Toolbar meta: total / showing
+  const meta = view.querySelector('#toolbar-meta')
+  if (meta) {
+    meta.textContent = `${sorted.length.toLocaleString()} of ${currentFiles.length.toLocaleString()} files`
+  }
 
-  if (!filtered.length) {
+  if (!sorted.length) {
     const tr = document.createElement('tr')
     tr.innerHTML = `<td colspan="3" class="empty" style="border:none">No files match.</td>`
     tbody.appendChild(tr)
+    if (pagerHost) pagerHost.innerHTML = ''
     return
   }
 
-  for (const file of filtered) {
+  const totalPages = Math.max(1, Math.ceil(sorted.length / PAGE_SIZE))
+  if (currentPage >= totalPages) currentPage = totalPages - 1
+  const pageStart = currentPage * PAGE_SIZE
+  const pageEnd = Math.min(pageStart + PAGE_SIZE, sorted.length)
+  const visible = sorted.slice(pageStart, pageEnd)
+
+  for (const file of visible) {
     const tr = document.createElement('tr')
     tr.dataset.name = file.name
     tr.innerHTML = `
@@ -322,7 +402,6 @@ function renderRows(table) {
     tr.querySelector('.fname').textContent = file.name
     tr.querySelector('.col-size').textContent = formatSize(file.length)
 
-    // Restore visible state if this file is mid-download or done
     const state = activeRowState.get(file)
     const progressCell = tr.querySelector('.col-progress')
     if (state) {
@@ -332,17 +411,87 @@ function renderRows(table) {
     } else if (file.done) {
       renderDoneCell(progressCell)
       tr.classList.add('done')
+    } else {
+      // Restored mid-download (selected pre-refresh, pieces in flight,
+      // no in-memory state object): show current file.progress so the row
+      // doesn't look idle.
+      const persisted = currentTorrent ? getTorrentState(currentTorrent.infoHash) : { selected: [] }
+      if (persisted.selected.includes(file.path)) {
+        tr.classList.add('downloading')
+        renderProgress(progressCell, file.progress || 0)
+      }
     }
 
     tr.addEventListener('click', () => onRowClick(file, tr, progressCell))
     tbody.appendChild(tr)
   }
+
+  if (pagerHost) renderPager(pagerHost, sorted.length, totalPages)
+}
+
+function renderPager(host, total, totalPages) {
+  if (totalPages <= 1) { host.innerHTML = ''; return }
+  host.innerHTML = `
+    <div class="pager">
+      <button class="pg first" type="button" title="first page">«</button>
+      <button class="pg prev" type="button" title="previous page">‹</button>
+      <span class="pg-info">page <input class="pg-input" type="number" min="1" max="${totalPages}" /> of ${totalPages.toLocaleString()}</span>
+      <button class="pg next" type="button" title="next page">›</button>
+      <button class="pg last" type="button" title="last page">»</button>
+    </div>
+  `
+  const input = host.querySelector('.pg-input')
+  input.value = String(currentPage + 1)
+  const goto = (n) => {
+    const next = Math.max(0, Math.min(totalPages - 1, n))
+    if (next === currentPage) return
+    currentPage = next
+    const table = view.querySelector('.file-table')
+    if (table) renderRows(table, host)
+  }
+  host.querySelector('.first').addEventListener('click', () => goto(0))
+  host.querySelector('.prev').addEventListener('click', () => goto(currentPage - 1))
+  host.querySelector('.next').addEventListener('click', () => goto(currentPage + 1))
+  host.querySelector('.last').addEventListener('click', () => goto(totalPages - 1))
+  input.addEventListener('change', () => goto((parseInt(input.value, 10) || 1) - 1))
+  input.addEventListener('keydown', (e) => { if (e.key === 'Enter') goto((parseInt(input.value, 10) || 1) - 1) })
+
+  host.querySelector('.first').disabled = currentPage === 0
+  host.querySelector('.prev').disabled = currentPage === 0
+  host.querySelector('.next').disabled = currentPage >= totalPages - 1
+  host.querySelector('.last').disabled = currentPage >= totalPages - 1
+}
+
+function _startFileDownload(file, row, progressCell) {
+  const newState = { row, progressCell, handle: null, status: 'downloading', progress: 0 }
+  activeRowState.set(file, newState)
+  if (row) row.classList.add('downloading')
+  if (progressCell) renderProgress(progressCell, 0)
+
+  newState.handle = downloadFile(currentTorrent, file, ({ progress, done, error }) => {
+    if (error) {
+      newState.status = 'error'
+      if (newState.progressCell) newState.progressCell.textContent = 'error'
+      if (newState.row) newState.row.classList.remove('downloading')
+      return
+    }
+    newState.progress = progress
+    if (done) {
+      newState.status = 'done'
+      if (newState.progressCell) renderDoneCell(newState.progressCell)
+      if (newState.row) {
+        newState.row.classList.remove('downloading')
+        newState.row.classList.add('done')
+      }
+    } else if (newState.progressCell) {
+      renderProgress(newState.progressCell, progress)
+    }
+  })
 }
 
 function onRowClick(file, row, progressCell) {
   const state = activeRowState.get(file)
   if (state && state.status === 'downloading') {
-    // Cancel
     state.handle.cancel()
     state.status = 'cancelled'
     progressCell.textContent = 'cancelled'
@@ -350,8 +499,9 @@ function onRowClick(file, row, progressCell) {
     activeRowState.delete(file)
     return
   }
-  if (file.done && (!state || state.status === 'done')) {
-    // Already saved this session — re-trigger download via blob (cheap)
+  if (file.done) {
+    // Already complete in this session or restored from a previous one —
+    // re-trigger the save dialog from the cached blob.
     file.blob().then((blob) => {
       const url = URL.createObjectURL(blob)
       const a = document.createElement('a')
@@ -361,44 +511,20 @@ function onRowClick(file, row, progressCell) {
       a.click()
       a.remove()
       setTimeout(() => URL.revokeObjectURL(url), 60_000)
-    })
+    }).catch((err) => derr('blob() failed: ' + (err.message || err)))
     return
   }
-
-  // Start a new download
-  const newState = { row, progressCell, handle: null, status: 'downloading', progress: 0 }
-  activeRowState.set(file, newState)
-  row.classList.add('downloading')
-  renderProgress(progressCell, 0)
-
-  newState.handle = downloadFile(currentTorrent, file, ({ progress, done, error }) => {
-    if (error) {
-      newState.status = 'error'
-      progressCell.textContent = 'error'
-      row.classList.remove('downloading')
-      return
-    }
-    newState.progress = progress
-    if (done) {
-      newState.status = 'done'
-      renderDoneCell(progressCell)
-      row.classList.remove('downloading')
-      row.classList.add('done')
-    } else {
-      renderProgress(progressCell, progress)
-    }
-  })
+  _startFileDownload(file, row, progressCell)
 }
 
 function renderProgress(cell, fraction) {
-  const pct = Math.max(0, Math.min(100, fraction * 100))
+  if (!cell) return
+  const pct = Math.max(0, Math.min(100, (fraction || 0) * 100))
   cell.innerHTML = `<span class="bar"><span style="width:${pct.toFixed(1)}%"></span></span><span class="pct">${pct.toFixed(0)}%</span>`
 }
 
 function renderDoneCell(cell) {
-  // Distinguish "done and seeding to other browsers" from "done, opted out
-  // of seeding". The peer count is the most honest signal that the swarm is
-  // real and the user is contributing to it.
+  if (!cell) return
   if (!isSeedingEnabled()) {
     cell.textContent = 'done'
     return
@@ -409,6 +535,7 @@ function renderDoneCell(cell) {
 
 function applyRowState(file, state) {
   const { row, progressCell, status, progress } = state
+  if (!row || !progressCell) return
   if (status === 'downloading') {
     row.classList.add('downloading')
     renderProgress(progressCell, progress || file.progress || 0)
@@ -423,8 +550,6 @@ function applyRowState(file, state) {
 }
 
 function updateActiveRows() {
-  // Walk currentFiles; refresh per-file progress text, and refresh the
-  // "seeding · N peers" cell on done rows so the peer count stays live.
   for (const file of currentFiles) {
     const state = activeRowState.get(file)
     if (!state || !state.progressCell) continue
@@ -437,12 +562,14 @@ function updateActiveRows() {
   }
 }
 
-// ---------- Filter ----------
+// ---------- Filter input ----------
 
 filterInput.addEventListener('input', () => {
   currentFilter = filterInput.value.trim()
+  currentPage = 0
   const table = view.querySelector('.file-table')
-  if (table) renderRows(table)
+  const pagerHost = view.querySelector('#pager-host')
+  if (table) renderRows(table, pagerHost)
 })
 
 // ---------- Router ----------
@@ -469,7 +596,6 @@ window.addEventListener('hashchange', route)
 // ---------- Seeding toggle ----------
 
 function initSeedingToggle() {
-  // Restore preference (default ON).
   try {
     const saved = localStorage.getItem(SEEDING_PREF_KEY)
     if (saved === 'false') setSeedingEnabled(false)
@@ -480,10 +606,41 @@ function initSeedingToggle() {
   cb.addEventListener('change', () => {
     setSeedingEnabled(cb.checked)
     try { localStorage.setItem(SEEDING_PREF_KEY, String(cb.checked)) } catch {}
-    // Refresh visible "seeding · N peers" indicators immediately.
     updateActiveRows()
   })
 }
 
+// ---------- Persistent global status bar ----------
+//
+// Always visible at the bottom of the page, on every view. Aggregates state
+// across every torrent the client knows about so the user can see ongoing
+// downloads even after navigating away from the file list.
+
+function initGlobalStatusBar() {
+  const bar = document.getElementById('global-status')
+  if (!bar) return
+  const summary = bar.querySelector('.gs-summary')
+  const stats = bar.querySelector('.gs-stats')
+  const tick = () => {
+    const s = getGlobalStats()
+    if (!s.torrents) {
+      bar.classList.add('idle')
+      summary.textContent = 'idle · no torrents loaded'
+      stats.textContent = ''
+      return
+    }
+    bar.classList.toggle('idle', s.downloading === 0 && s.speed === 0)
+    const dlText = s.downloading > 0
+      ? `${s.downloading.toLocaleString()} downloading`
+      : 'no active downloads'
+    const dotClass = s.speed > 0 ? 'live' : (s.peers > 0 ? 'warn' : '')
+    summary.innerHTML = `<span class="gs-dot ${dotClass}"></span>${dlText} · ${s.done.toLocaleString()} done`
+    stats.textContent = `${s.peers} peer${s.peers === 1 ? '' : 's'} · ↓ ${formatSize(s.speed)}/s`
+  }
+  tick()
+  setInterval(tick, 1000)
+}
+
 initSeedingToggle()
+initGlobalStatusBar()
 route()

@@ -1,5 +1,5 @@
 import WebTorrent from 'webtorrent/dist/webtorrent.min.js'
-import streamSaver from 'streamsaver'
+import { getTorrentState, markSelected, markDeselected, markDone, isDone } from './storage.js'
 
 const dlog = (m) => window.dlog && window.dlog('[wt] ' + m)
 const dok = (m) => window.dok && window.dok('[wt] ' + m)
@@ -8,8 +8,8 @@ const derr = (m) => window.derr && window.derr('[wt] ' + m)
 
 dok('torrent.js loaded; WebTorrent type=' + (typeof WebTorrent))
 
-// Public WSS trackers — added to every torrent so browser peers can find each other
-// even when the magnet's own announce list is HTTP/UDP-only (typical of IA torrents).
+// Public WSS trackers — added to every torrent so browser peers can find each
+// other even when the magnet's own announce list is HTTP/UDP-only.
 export const WSS_TRACKERS = [
   'wss://tracker.openwebtorrent.com',
   'wss://tracker.btorrent.xyz',
@@ -33,13 +33,11 @@ export function getClient() {
 }
 
 const _torrentsByHash = new Map()
-const _addPromises = new Map() // torrentId (magnet/hash) -> Promise<Torrent>
+const _addPromises = new Map()
+const _doneListeners = new Map() // file -> handler, so we don't double-bind
 
 const METADATA_WARN_MS = 30_000
 
-// Default-on seeding: after a download completes the tab keeps the pieces
-// selected and serves them to other browsers in the swarm. The opt-out
-// destroys completed torrents so the tab stops uploading.
 let _seedingEnabled = true
 export function isSeedingEnabled() { return _seedingEnabled }
 export function setSeedingEnabled(enabled) {
@@ -47,9 +45,6 @@ export function setSeedingEnabled(enabled) {
   dlog('seeding=' + _seedingEnabled)
   if (!_seedingEnabled) {
     for (const [, t] of Array.from(_torrentsByHash.entries())) {
-      // Only tear down torrents that aren't actively pulling pieces — leaving
-      // an in-flight download alone; it'll clean itself up on completion via
-      // downloadFile's end handler.
       if (t.progress >= 1 || (t.downloadSpeed || 0) < 1024) _destroyTorrent(t)
     }
   }
@@ -68,7 +63,6 @@ export function addTorrent(torrentId, opts = {}) {
   if (_addPromises.has(torrentId)) return _addPromises.get(torrentId)
   const p = _doAdd(torrentId, opts)
   _addPromises.set(torrentId, p)
-  // If the add fails, drop the cached promise so a retry can happen.
   p.catch(() => _addPromises.delete(torrentId))
   return p
 }
@@ -76,12 +70,6 @@ export function addTorrent(torrentId, opts = {}) {
 async function _doAdd(torrentId, { webSeeds = [], torrentFile = null } = {}) {
   const client = getClient()
 
-  // Genesis path: fetch the .torrent file ourselves (metadata only, ~50 KB)
-  // and hand the bytes to WebTorrent. This sidesteps the chicken-and-egg of
-  // "browser needs metadata to peer, but can only get metadata from a peer."
-  // The actual data still rides the swarm — the .torrent file is just the
-  // file list + piece hashes. WebTorrent in the browser can't fetch HTTP
-  // .torrent URLs itself (Node-only feature), so we do it here.
   let addArg = torrentId
   if (torrentFile) {
     try {
@@ -99,10 +87,11 @@ async function _doAdd(torrentId, { webSeeds = [], torrentFile = null } = {}) {
   return new Promise((resolve, reject) => {
     const opts = {
       announce: WSS_TRACKERS,
-      // BEP-19 web seeds — IA serves these with permissive CORS, so the
-      // browser can pull pieces over HTTPS as a bootstrap until other browser
-      // peers join the swarm.
       urlList: webSeeds,
+      // Start with no pieces selected — the catalog has multi-GB torrents and
+      // the user opts in per-file. WebTorrent's default would auto-download
+      // the entire torrent.
+      deselect: true,
     }
     const existing = _findExisting(client, torrentId)
     if (existing) {
@@ -119,34 +108,26 @@ async function _doAdd(torrentId, { webSeeds = [], torrentFile = null } = {}) {
     const startedAt = Date.now()
     let settled = false
 
-    // Soft warning instead of a hard reject: late peers (or a slow .torrent
-    // mirror) shouldn't tear down the whole add(). The page stays alive and
-    // can still pick up peers and pieces whenever they show up.
     const warnTimer = setTimeout(() => {
       if (settled) return
       const peers = torrent.numPeers || 0
-      dwarn('still waiting for metadata after ' + METADATA_WARN_MS / 1000 + 's; peers=' + peers +
-            ' (will keep listening for late peers and web seeds)')
+      dwarn('still waiting for metadata after ' + METADATA_WARN_MS / 1000 + 's; peers=' + peers)
     }, METADATA_WARN_MS)
 
     const torrent = client.add(addArg, opts, (t) => {
       settled = true
       clearTimeout(warnTimer)
       t._romSeekerTorrentId = torrentId
+      _torrentsByHash.set(t.infoHash, t)
       dok('torrent ready cb infoHash=' + t.infoHash + ' files=' + t.files.length +
           ' (after ' + ((Date.now() - startedAt) / 1000).toFixed(1) + 's)')
       _attachDiagnostics(t)
+      _restoreSelections(t)
       resolve(t)
     })
     torrent.on('infoHash', () => dlog('infoHash event ' + torrent.infoHash))
     torrent.on('metadata', () => {
-      // Deselect everything so prefetch doesn't trigger a multi-GB download.
-      // Files become "selected" only when the user clicks a row — and they
-      // *stay* selected after the download completes, which is what keeps
-      // the tab seeding pieces to other browsers in the swarm.
-      dlog('metadata event; deselecting all (download is opt-in per file)')
-      torrent.deselect(0, torrent.pieces.length - 1, false)
-      for (const f of torrent.files) f.deselect()
+      dlog('metadata event (deselect:true so nothing auto-downloads)')
       _torrentsByHash.set(torrent.infoHash, torrent)
     })
     torrent.on('wire', (wire, addr) => dlog('wire ' + (addr || '?')))
@@ -161,8 +142,44 @@ async function _doAdd(torrentId, { webSeeds = [], torrentFile = null } = {}) {
   })
 }
 
-// Periodic + event-based logging so a stuck download surfaces useful state
-// (peer count, bytes flowing, web seed activity) instead of a silent 0 B/s.
+// Re-arm any selections the user made before a refresh. WebTorrent's chunk
+// store (OPFS in modern browsers) already has the pieces; we just need to
+// tell the torrent which files the user still wants so it keeps requesting
+// any missing pieces and emits 'done' once they're all in.
+function _restoreSelections(torrent) {
+  const state = getTorrentState(torrent.infoHash)
+  if (!state.selected.length && !state.done.length) return
+  let restored = 0
+  for (const path of state.selected) {
+    const file = torrent.files.find((f) => f.path === path || f.name === path)
+    if (file && !file.done) {
+      file.select()
+      _bindDoneHandler(torrent, file)
+      restored++
+    }
+  }
+  // Also bind a 'done' handler to any file that's already complete so
+  // subsequent state stays consistent; webtorrent emits 'done' on next tick
+  // for a freshly-loaded already-complete file.
+  for (const path of state.done) {
+    const file = torrent.files.find((f) => f.path === path || f.name === path)
+    if (file) _bindDoneHandler(torrent, file)
+  }
+  if (restored) dok('restored ' + restored + ' selection(s) for ' + torrent.infoHash.slice(0, 8))
+}
+
+function _bindDoneHandler(torrent, file) {
+  if (_doneListeners.has(file)) return
+  const handler = () => {
+    markDone(torrent.infoHash, file.path)
+    dok('file done: ' + file.name)
+  }
+  _doneListeners.set(file, handler)
+  if (file.done) handler()
+  else file.once('done', handler)
+}
+
+// Periodic + event-based logging so a stuck download surfaces useful state.
 function _attachDiagnostics(torrent) {
   let lastDownloaded = 0
   const tick = setInterval(() => {
@@ -178,16 +195,10 @@ function _attachDiagnostics(torrent) {
     }
   }, 5000)
   torrent.once('close', () => clearInterval(tick))
-  torrent.on('verified', (idx) => dlog('piece verified ' + idx))
-  torrent.on('verify', (idx) => dlog('verify failed for piece ' + idx))
   torrent.on('done', () => dok('torrent done'))
 }
 
 function _findExisting(_client, magnetOrHash) {
-  // Look up by infoHash in our own map. WebTorrent v2's client.get() is
-  // async (returns a Promise), so we can't use it synchronously here.
-  // Hex hashes only — base32 magnets get parsed inside WebTorrent itself,
-  // and a duplicate add will be caught by client.add()'s _infoHash check.
   const m = /xt=urn:btih:([0-9a-f]{40})/i.exec(magnetOrHash || '')
   let hash = m ? m[1].toLowerCase() : null
   if (!hash && /^[0-9a-f]{40}$/i.test(magnetOrHash || '')) hash = magnetOrHash.toLowerCase()
@@ -196,19 +207,22 @@ function _findExisting(_client, magnetOrHash) {
 }
 
 /**
- * Download a single file from the torrent to disk via StreamSaver.
- * Returns an object with `cancel()` to abort.
+ * Mark a file as wanted and start downloading it. WebTorrent stores pieces
+ * in OPFS as they arrive; on completion we read them back as a Blob and
+ * trigger a normal browser download. This works on iOS Safari (where
+ * StreamSaver is flaky) and naturally resumes after a refresh, because the
+ * pieces are already in OPFS and `file.done` becomes true as soon as the
+ * torrent is re-added.
+ *
+ * Returns { cancel, getBlob } for the caller.
  */
 export function downloadFile(torrent, file, onProgress) {
-  // Mark this single file as wanted; leave the others deselected.
   file.select()
-
-  const writeStream = streamSaver.createWriteStream(file.name, {
-    size: file.length,
-  })
-  const writer = writeStream.getWriter()
+  markSelected(torrent.infoHash, file.path)
+  _bindDoneHandler(torrent, file)
 
   let cancelled = false
+  let saved = false
   let lastReported = -1
 
   const tickProgress = () => {
@@ -221,55 +235,70 @@ export function downloadFile(torrent, file, onProgress) {
   }
   const intervalId = setInterval(tickProgress, 500)
 
-  ;(async () => {
+  const onDone = async () => {
+    if (cancelled || saved) return
+    saved = true
+    clearInterval(intervalId)
     try {
-      const stream = file.createReadStream()
-      stream.on('data', async (chunk) => {
-        if (cancelled) return
-        // Backpressure: pause node-style stream while writer is busy.
-        stream.pause()
-        try {
-          await writer.write(chunk)
-          if (!cancelled) stream.resume()
-        } catch (err) {
-          if (!cancelled) console.warn('[download] writer error:', err)
-          cancelled = true
-          try { stream.destroy() } catch {}
-        }
-      })
-      stream.on('end', async () => {
-        clearInterval(intervalId)
-        if (!cancelled) {
-          try { await writer.close() } catch {}
-          tickProgress()
-          onProgress && onProgress({ progress: 1, downloaded: file.length, done: true })
-          // Honor the user's seeding preference: opt-out destroys the torrent
-          // now that they have what they came for.
-          if (!_seedingEnabled) _destroyTorrent(torrent)
-        }
-      })
-      stream.on('error', async (err) => {
-        clearInterval(intervalId)
-        console.warn('[download] read error:', err)
-        try { await writer.abort(err) } catch {}
-        onProgress && onProgress({ progress: file.progress, downloaded: file.downloaded, done: false, error: err })
-      })
+      const blob = await file.blob()
+      _triggerSave(blob, file.name)
+      onProgress && onProgress({ progress: 1, downloaded: file.length, done: true })
     } catch (err) {
-      clearInterval(intervalId)
-      console.warn('[download] setup error:', err)
-      try { await writer.abort(err) } catch {}
-      onProgress && onProgress({ progress: 0, downloaded: 0, done: false, error: err })
+      derr('blob() failed for ' + file.name + ': ' + (err.message || err))
+      onProgress && onProgress({ progress: file.progress, downloaded: file.downloaded, done: false, error: err })
     }
-  })()
+  }
+  if (file.done) onDone()
+  else file.once('done', onDone)
 
   return {
     cancel() {
+      if (cancelled) return
       cancelled = true
       clearInterval(intervalId)
-      try { writer.abort() } catch {}
+      file.removeListener('done', onDone)
       file.deselect()
+      markDeselected(torrent.infoHash, file.path)
+    },
+    // Manual re-save for completed files (used by the "click row to re-save"
+    // flow when the user has already downloaded once this session).
+    async resave() {
+      const blob = await file.blob()
+      _triggerSave(blob, file.name)
     },
   }
+}
+
+function _triggerSave(blob, name) {
+  const url = URL.createObjectURL(blob)
+  const a = document.createElement('a')
+  a.href = url
+  a.download = name
+  document.body.appendChild(a)
+  a.click()
+  a.remove()
+  setTimeout(() => URL.revokeObjectURL(url), 60_000)
+}
+
+// Aggregate stats across every torrent in the client — feeds the persistent
+// status bar so progress is visible even when the user is on another page.
+export function getGlobalStats() {
+  const client = _client
+  if (!client) return { torrents: 0, downloading: 0, done: 0, peers: 0, speed: 0 }
+  let downloading = 0
+  let done = 0
+  let peers = 0
+  let speed = 0
+  for (const t of client.torrents) {
+    peers += t.numPeers || 0
+    speed += t.downloadSpeed || 0
+    const state = getTorrentState(t.infoHash)
+    done += state.done.length
+    // Files in the persisted "selected" list that aren't yet done.
+    const doneSet = new Set(state.done)
+    for (const p of state.selected) if (!doneSet.has(p)) downloading++
+  }
+  return { torrents: client.torrents.length, downloading, done, peers, speed }
 }
 
 export function formatSize(bytes) {

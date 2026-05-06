@@ -61,6 +61,29 @@ if (origFetch) {
       }))
     }
 
+    // Strip CORS-preflight-triggering headers from archive.org GETs.
+    //
+    // webtorrent v2.5.1 sets `Cache-Control: no-store` (webconn.js:128) and
+    // `user-agent` on every web seed request. Cache-Control is NOT on the
+    // CORS-safelisted-request-header list, so the browser issues an OPTIONS
+    // preflight, which IA's download endpoint doesn't whitelist for
+    // `access-control-request-headers: cache-control`. Result: the preflight
+    // fails, the GET never runs, fetch() throws "Failed to fetch" before any
+    // bytes are transferred. The `cache: 'no-store'` *option* already gives
+    // the no-cache semantics we want client-side; the explicit header is
+    // redundant and breaks CORS. user-agent is browser-forbidden anyway.
+    if (url.includes('archive.org') && init && init.headers) {
+      const stripped = {}
+      const src = init.headers
+      const entries = (typeof src.entries === 'function') ? src.entries() : Object.entries(src)
+      for (const [k, v] of entries) {
+        const kl = String(k).toLowerCase()
+        if (kl === 'cache-control' || kl === 'user-agent') continue
+        stripped[k] = v
+      }
+      init = { ...init, headers: stripped }
+    }
+
     return origFetch(input, init).then(
       (res) => {
         if (!res.ok && url.includes('archive.org')) {
