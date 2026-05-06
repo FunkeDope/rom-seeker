@@ -2,6 +2,18 @@ import { addTorrent, downloadFile, formatSize, setSeedingEnabled, isSeedingEnabl
 
 const SEEDING_PREF_KEY = 'rom-seeker:seeding'
 
+// Resolve a catalog `torrent_file` field into an absolute fetch URL. Local
+// relative paths (the default — bundled in /public/torrents/) become
+// same-origin URLs under BASE_URL, sidestepping the cross-origin CORS gap on
+// archive.org's synthesized .torrent files. Absolute URLs are returned as-is
+// for cases where a remote fetch happens to work.
+function resolveTorrentFile(entry) {
+  const t = entry.torrent_file
+  if (!t) return null
+  if (/^https?:/i.test(t)) return t
+  return `${import.meta.env.BASE_URL}${t}`
+}
+
 const dlog = (m) => window.dlog && window.dlog(m)
 const dok = (m) => window.dok && window.dok(m)
 const dwarn = (m) => window.dwarn && window.dwarn(m)
@@ -44,9 +56,9 @@ function prefetchCatalog(entries) {
   for (const entry of entries) {
     if (!entry.magnet && !entry.torrent_file) continue
     const webSeeds = entry.web_seeds || (entry.web_seed ? [entry.web_seed] : [])
-    const torrentFile = entry.torrent_file || null
+    const torrentFile = resolveTorrentFile(entry)
     dlog('prefetch ' + entry.slug)
-    addTorrent(entry.magnet || entry.torrent_file, { webSeeds, torrentFile }).then(
+    addTorrent(entry.magnet || torrentFile, { webSeeds, torrentFile }).then(
       (t) => dok('prefetch ' + entry.slug + ' ready: files=' + t.files.length),
       (err) => dwarn('prefetch ' + entry.slug + ' failed: ' + (err.message || err)),
     )
@@ -182,12 +194,12 @@ async function renderCollection(slug) {
     <div class="banner info" id="loading-banner">Connecting to swarm and fetching torrent metadata…</div>
   `
   const webSeeds = entry.web_seeds || (entry.web_seed ? [entry.web_seed] : [])
-  const torrentFile = entry.torrent_file || null
+  const torrentFile = resolveTorrentFile(entry)
   dlog('addTorrent for ' + slug + (torrentFile ? ' (.torrent + magnet)' : ' (magnet)'))
 
   let torrent
   try {
-    torrent = await addTorrent(entry.magnet || entry.torrent_file, { webSeeds, torrentFile })
+    torrent = await addTorrent(entry.magnet || torrentFile, { webSeeds, torrentFile })
     dok('torrent ready: ' + torrent.infoHash + ' files=' + torrent.files.length + ' size=' + formatSize(torrent.length))
   } catch (err) {
     derr('addTorrent failed: ' + (err.message || err))

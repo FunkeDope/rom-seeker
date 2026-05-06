@@ -6,7 +6,8 @@
   "scripts": {
     "dev": "vite",
     "build": "vite build",
-    "preview": "vite preview"
+    "preview": "vite preview",
+    "fetch-torrents": "node scripts/fetch-torrents.mjs"
   },
   "dependencies": {
     "streamsaver": "^2.0.6",
