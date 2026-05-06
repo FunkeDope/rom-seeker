@@ -4,7 +4,6 @@
     "title": "MAME — Arcade ROMs",
     "subtitle": "MAME 0.251 ROM set (Internet Archive)",
     "magnet": "magnet:?xt=urn:btih:7XQE3BQ5M25XH2BIMQEZXXKHHMWWCRFG&dn=mame251&tr=http%3A%2F%2Fbt1.archive.org%3A6969%2Fannounce",
-    "torrent_url": "https://archive.org/download/mame251/mame251_archive.torrent",
     "web_seeds": ["https://archive.org/download/mame251/"],
     "source": "https://archive.org/details/mame251"
   },

@@ -156,13 +156,12 @@ async function renderCollection(slug) {
   statusHost.innerHTML = `
     <div class="banner info" id="loading-banner">Connecting to swarm and fetching torrent metadata…</div>
   `
-  const torrentId = entry.magnet || entry.torrent_url
   const webSeeds = entry.web_seeds || (entry.web_seed ? [entry.web_seed] : [])
-  dlog('addTorrent for ' + slug + ' via ' + (entry.magnet ? 'magnet' : 'torrent_url'))
+  dlog('addTorrent for ' + slug)
 
   let torrent
   try {
-    torrent = await addTorrent(torrentId, { webSeeds })
+    torrent = await addTorrent(entry.magnet, { webSeeds })
     dok('torrent ready: ' + torrent.infoHash + ' files=' + torrent.files.length + ' size=' + formatSize(torrent.length))
   } catch (err) {
     derr('addTorrent failed: ' + (err.message || err))

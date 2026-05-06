@@ -61,7 +61,7 @@ export function addTorrent(torrentId, { webSeeds = [] } = {}) {
       if (settled) return
       const peers = torrent.numPeers || 0
       derr('metadata timeout after ' + METADATA_TIMEOUT_MS / 1000 + 's; peers=' + peers +
-           ' (no WebRTC seeders found via WSS trackers; magnet alone cannot fetch metadata in browser)')
+           ' (no WebRTC seeders found via WSS trackers)')
     }, METADATA_TIMEOUT_MS)
 
     const torrent = client.add(torrentId, opts, (t) => {
