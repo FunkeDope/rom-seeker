@@ -88,10 +88,15 @@ async function _doAdd(torrentId, { webSeeds = [], torrentFile = null } = {}) {
     const opts = {
       announce: WSS_TRACKERS,
       urlList: webSeeds,
-      // Start with no pieces selected — the catalog has multi-GB torrents and
-      // the user opts in per-file. WebTorrent's default would auto-download
-      // the entire torrent.
+      // Start with no pieces selected. Multi-GB catalog torrents would
+      // otherwise auto-download in full; the user opts in per file.
       deselect: true,
+      // Don't re-hash every piece on add. For a fresh torrent there's
+      // nothing to verify (every piece is empty); for a previously-loaded
+      // one the OPFS pieces are still ours. Cuts ~30s off page load on
+      // 17,000-file torrents, where the verify loop iterates every piece
+      // even when nothing has been downloaded yet.
+      skipVerify: true,
     }
     const existing = _findExisting(client, torrentId)
     if (existing) {
@@ -130,7 +135,11 @@ async function _doAdd(torrentId, { webSeeds = [], torrentFile = null } = {}) {
       dlog('metadata event (deselect:true so nothing auto-downloads)')
       _torrentsByHash.set(torrent.infoHash, torrent)
     })
-    torrent.on('wire', (wire, addr) => dlog('wire ' + (addr || '?')))
+    torrent.on('wire', (wire, addr) => {
+      const kind = wire && wire.type ? wire.type : 'peer'
+      const u = (wire && wire.url) || addr || '?'
+      dlog('wire ' + kind + ' ' + String(u).slice(0, 80))
+    })
     torrent.on('noPeers', (announceType) => dwarn('noPeers: ' + announceType))
     torrent.on('warning', (err) => dwarn('torrent warning: ' + (err.message || err)))
     torrent.on('error', (err) => {
@@ -207,14 +216,14 @@ function _findExisting(_client, magnetOrHash) {
 }
 
 /**
- * Mark a file as wanted and start downloading it. WebTorrent stores pieces
- * in OPFS as they arrive; on completion we read them back as a Blob and
- * trigger a normal browser download. This works on iOS Safari (where
- * StreamSaver is flaky) and naturally resumes after a refresh, because the
- * pieces are already in OPFS and `file.done` becomes true as soon as the
- * torrent is re-added.
+ * Mark a file as wanted. WebTorrent's piece queue then requests pieces from
+ * the swarm + web seed wires; pieces accumulate in the OPFS chunk store. On
+ * file 'done' we read them back as a Blob and trigger a normal browser
+ * download. Refresh-resume comes free because the pieces are already in OPFS
+ * — _restoreSelections() re-arms file.select() on the freshly-added torrent
+ * and any remaining pieces complete from there.
  *
- * Returns { cancel, getBlob } for the caller.
+ * Returns { cancel }.
  */
 export function downloadFile(torrent, file, onProgress) {
   file.select()
@@ -259,12 +268,6 @@ export function downloadFile(torrent, file, onProgress) {
       file.removeListener('done', onDone)
       file.deselect()
       markDeselected(torrent.infoHash, file.path)
-    },
-    // Manual re-save for completed files (used by the "click row to re-save"
-    // flow when the user has already downloaded once this session).
-    async resave() {
-      const blob = await file.blob()
-      _triggerSave(blob, file.name)
     },
   }
 }

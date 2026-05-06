@@ -1,56 +1,71 @@
-// Patches the global fetch with two behaviors:
+// Generic fetch patches for WebTorrent web-seed traffic. None of this is
+// IA-specific — it fixes interactions between webtorrent v2.5.1's webconn and
+// any browser/web-seed combo that conforms to the same specs.
 //
-// 1. Synthesize zero-byte responses for BEP-47 "padding file" URLs.
+// 1. BEP-47 padding files
+//    Multi-file torrents pad real files to piece boundaries by inserting
+//    synthetic "padding" entries in the file list. The padding bytes are
+//    zeroed out per spec, and the piece SHA1 is computed over those zeros —
+//    they are NOT files that exist on the web-seed host. WebTorrent v2.5.1
+//    has no awareness of BEP-47 and tries to fetch them like real files,
+//    Promise.all in webconn.js rejects on the 404, and the entire piece
+//    reconstruction fails. Detect padding URLs and synthesize a zero-byte
+//    206 response locally — the piece then verifies cleanly.
 //
-//    IA's MAME-style torrents include synthetic padding files in their .torrent
-//    metadata (paths like `<id>/.____padding_file/0`) so each real ROM aligns
-//    to a piece boundary. These files don't exist on the actual web seed host
-//    — but WebTorrent v2.5.1 has no awareness of BEP-47 and treats them as
-//    real files. It fetches them via HTTP, gets a 404, and `Promise.all` in
-//    webconn.js rejects, taking down the entire piece reconstruction. Result:
-//    zero bytes ever flow.
+// 2. CORS preflight on web-seed range requests
+//    webconn.js sends `Cache-Control: no-store` and `user-agent` headers on
+//    every web-seed fetch. Cache-Control is NOT on the CORS-safelisted
+//    request-header list, so any cross-origin GET it issues triggers an
+//    OPTIONS preflight; few web-seed hosts whitelist `cache-control` in
+//    `access-control-allow-headers`, so the preflight fails and the GET
+//    never runs. The `cache: 'no-store'` *option* already gives no-cache
+//    semantics; the header is redundant. `user-agent` is browser-forbidden
+//    anyway. Strip both on any fetch carrying a Range header (= the
+//    web-seed pattern), regardless of host.
 //
-//    Per BEP-47 the padding bytes are zero, and the piece SHA1 is computed
-//    over those zeros — so we can substitute a local zero buffer of the
-//    requested length and the piece verifies correctly.
+// 3. Diagnostics
+//    webconn swallows fetch errors via the `debug` package, which never
+//    reaches the on-page log. Mirror every Range-bearing fetch's lifecycle
+//    (attempt / response / error) into dlog/dwarn/derr so the debug panel
+//    shows what's happening when a download stalls.
 //
-// 2. Surface archive.org fetch failures in the on-page debug panel.
-//
-//    WebTorrent's webconn swallows HTTP errors silently (only writes them to
-//    the `debug` package, which the user can't see). That's why "0 B/s with 3
-//    peers" produced zero log lines. Wrap fetch and forward archive.org
-//    failures through dwarn / derr so they show up.
-//
-// Must be imported BEFORE the WebTorrent bundle: cross-fetch-ponyfill captures
-// `self.fetch` at module-evaluation time, so any patch later than that is
-// invisible to webconn. Importing this module from the very top of main.js,
-// ahead of `./torrent.js`, gets the order right.
+// Must be imported BEFORE the WebTorrent bundle: webtorrent (via
+// cross-fetch-ponyfill in older bundles, or direct `self.fetch` capture in
+// the v2.5.1 dist) reads self.fetch at module-evaluation time. Importing
+// this module from the very top of main.js ahead of ./torrent.js gets the
+// order right.
 
 const dlog = (m) => self.dlog && self.dlog('[fetch] ' + m)
 const dwarn = (m) => self.dwarn && self.dwarn('[fetch] ' + m)
 const derr = (m) => self.derr && self.derr('[fetch] ' + m)
 
-// Matches all common padding-file naming conventions:
+// Padding-file URL patterns. Three flavors in the wild:
 //   - BitComet / IA pipeline: `.____padding_file/<n>` (4+ underscores)
 //   - Older mktorrent style:  `____padding_file_<n>_<hex>`
 //   - Various `.pad/<n>` shorthands
 const PADDING_URL = /(?:\/|^)(?:\.?_+padding_file|\.pad)(?:\/|_)/i
+
+function getRange(input, init) {
+  const h = (init && init.headers) || (input && input.headers) || null
+  if (!h) return ''
+  if (typeof h.get === 'function') return h.get('range') || ''
+  return h.range || h.Range || ''
+}
 
 const origFetch = self.fetch && self.fetch.bind(self)
 
 if (origFetch) {
   self.fetch = function patchedFetch(input, init) {
     const url = typeof input === 'string' ? input : (input && input.url) || ''
+    const range = getRange(input, init)
+    const isWebSeed = !!range
 
     if (PADDING_URL.test(url)) {
-      const range = (init && init.headers && (init.headers.range || init.headers.Range)) ||
-        (input && input.headers && input.headers.get && input.headers.get('range')) || ''
       const m = /bytes=(\d+)-(\d+)/.exec(range)
       const start = m ? parseInt(m[1], 10) : 0
       const end = m ? parseInt(m[2], 10) : 0
       const len = m ? Math.max(0, end - start + 1) : 0
-      const data = new Uint8Array(len)
-      return Promise.resolve(new Response(data, {
+      return Promise.resolve(new Response(new Uint8Array(len), {
         status: 206,
         statusText: 'Partial Content',
         headers: {
@@ -61,18 +76,7 @@ if (origFetch) {
       }))
     }
 
-    // Strip CORS-preflight-triggering headers from archive.org GETs.
-    //
-    // webtorrent v2.5.1 sets `Cache-Control: no-store` (webconn.js:128) and
-    // `user-agent` on every web seed request. Cache-Control is NOT on the
-    // CORS-safelisted-request-header list, so the browser issues an OPTIONS
-    // preflight, which IA's download endpoint doesn't whitelist for
-    // `access-control-request-headers: cache-control`. Result: the preflight
-    // fails, the GET never runs, fetch() throws "Failed to fetch" before any
-    // bytes are transferred. The `cache: 'no-store'` *option* already gives
-    // the no-cache semantics we want client-side; the explicit header is
-    // redundant and breaks CORS. user-agent is browser-forbidden anyway.
-    if (url.includes('archive.org') && init && init.headers) {
+    if (isWebSeed && init && init.headers) {
       const stripped = {}
       const src = init.headers
       const entries = (typeof src.entries === 'function') ? src.entries() : Object.entries(src)
@@ -84,18 +88,21 @@ if (origFetch) {
       init = { ...init, headers: stripped }
     }
 
+    if (isWebSeed) dlog('GET ' + (range ? range + ' ' : '') + url.slice(0, 110))
+
     return origFetch(input, init).then(
       (res) => {
-        if (!res.ok && url.includes('archive.org')) {
-          dwarn(res.status + ' ' + url.slice(0, 140))
+        if (isWebSeed) {
+          if (res.ok) dlog(res.status + ' ← ' + url.slice(0, 110))
+          else dwarn(res.status + ' ← ' + url.slice(0, 130))
         }
         return res
       },
       (err) => {
-        if (url.includes('archive.org')) derr('throw ' + (err.message || err) + ' on ' + url.slice(0, 120))
+        if (isWebSeed) derr('throw ' + (err.message || err) + ' on ' + url.slice(0, 110))
         throw err
       },
     )
   }
-  dlog('patch installed (BEP-47 padding + archive.org error surfacing)')
+  dlog('patch installed (BEP-47 padding + CORS preflight strip + webseed logging)')
 }
