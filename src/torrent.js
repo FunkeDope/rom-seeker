@@ -71,6 +71,7 @@ async function _doAdd(torrentId, { webSeeds = [], torrentFile = null } = {}) {
   const client = getClient()
 
   let addArg = torrentId
+  let pieceCount = 0
   if (torrentFile) {
     try {
       dlog('fetching .torrent ' + torrentFile)
@@ -79,6 +80,8 @@ async function _doAdd(torrentId, { webSeeds = [], torrentFile = null } = {}) {
       const buf = new Uint8Array(await res.arrayBuffer())
       dok('.torrent fetched: ' + buf.byteLength + ' bytes')
       addArg = buf
+      pieceCount = _piecesCountFromTorrent(buf)
+      if (pieceCount) dlog('parsed pieces=' + pieceCount)
     } catch (err) {
       dwarn('.torrent fetch failed (' + (err.message || err) + '); falling back to magnet')
     }
@@ -91,12 +94,18 @@ async function _doAdd(torrentId, { webSeeds = [], torrentFile = null } = {}) {
       // Start with no pieces selected. Multi-GB catalog torrents would
       // otherwise auto-download in full; the user opts in per file.
       deselect: true,
-      // Don't re-hash every piece on add. For a fresh torrent there's
-      // nothing to verify (every piece is empty); for a previously-loaded
-      // one the OPFS pieces are still ours. Cuts ~30s off page load on
-      // 17,000-file torrents, where the verify loop iterates every piece
-      // even when nothing has been downloaded yet.
-      skipVerify: true,
+    }
+    // Provide an all-zero startup bitfield (= we have nothing) so webtorrent
+    // takes the bitfield-verify fast path on add instead of hashing every
+    // piece individually. On a 17k-file torrent that's the difference
+    // between ~30s and "instant" page load. We do NOT use skipVerify here:
+    // skipVerify also marks every piece as *verified*, which lies — file.done
+    // flips true on every file and file.blob() throws because the chunk
+    // store is empty. The bitfield path leaves verification semantics
+    // intact: pieces stay marked as not-present, file.done starts false,
+    // download proceeds normally.
+    if (pieceCount) {
+      opts.startupBitfield = new Uint8Array(Math.ceil(pieceCount / 8))
     }
     const existing = _findExisting(client, torrentId)
     if (existing) {
@@ -205,6 +214,26 @@ function _attachDiagnostics(torrent) {
   }, 5000)
   torrent.once('close', () => clearInterval(tick))
   torrent.on('done', () => dok('torrent done'))
+}
+
+// Pull pieces.length out of a .torrent's bencoded bytes without dragging in
+// the full parse-torrent module. The "pieces" field is a length-prefixed
+// concat of 20-byte SHA1 hashes (`6:pieces<L>:<L bytes>`); count = L / 20.
+function _piecesCountFromTorrent(bytes) {
+  const needle = [0x36, 0x3a, 0x70, 0x69, 0x65, 0x63, 0x65, 0x73] // "6:pieces"
+  outer: for (let i = 0; i < bytes.length - needle.length - 4; i++) {
+    for (let j = 0; j < needle.length; j++) {
+      if (bytes[i + j] !== needle[j]) continue outer
+    }
+    let p = i + needle.length
+    let n = 0
+    while (p < bytes.length && bytes[p] >= 0x30 && bytes[p] <= 0x39) {
+      n = n * 10 + (bytes[p] - 0x30)
+      p++
+    }
+    if (bytes[p] === 0x3a /* ':' */ && n > 0 && n % 20 === 0) return n / 20
+  }
+  return 0
 }
 
 function _findExisting(_client, magnetOrHash) {

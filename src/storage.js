@@ -13,7 +13,13 @@
 //     ...
 //   }
 
-const KEY = 'rom-seeker:torrents-v1'
+// v2 = post-skipVerify cleanup. v1 entries were polluted by skipVerify lying
+// about file.done, which caused _bindDoneHandler to write every restored
+// file into state.done even though no actual pieces existed.
+const KEY = 'rom-seeker:torrents-v2'
+
+// Best-effort: clear the old (poisoned) v1 storage on first load.
+try { localStorage.removeItem('rom-seeker:torrents-v1') } catch {}
 
 function read() {
   try { return JSON.parse(localStorage.getItem(KEY) || '{}') }

@@ -37,6 +37,8 @@
         background: #21262d; color: #c9d1d9; border: 1px solid #30363d;
         border-radius: 4px; padding: 2px 8px; font-size: 11px; cursor: pointer;
       }
+      #debug header .debug-actions { display: inline-flex; gap: 6px; }
+      #debug header button:hover { border-color: #58a6ff; color: #58a6ff; }
       #debug ol { margin: 0; padding: 0; list-style: none; }
       #debug li { padding: 2px 0; border-bottom: 1px dashed #21262d; word-break: break-word; }
       #debug li:last-child { border-bottom: none; }
@@ -61,7 +63,13 @@
     </header>
 
     <section id="debug" aria-live="polite">
-      <header><span>debug</span><button type="button" id="debug-clear">clear</button></header>
+      <header>
+        <span>debug</span>
+        <span class="debug-actions">
+          <button type="button" id="debug-copy">copy</button>
+          <button type="button" id="debug-clear">clear</button>
+        </span>
+      </header>
       <ol id="debug-log"></ol>
     </section>
 
@@ -107,6 +115,40 @@
 
         document.getElementById('debug-clear').addEventListener('click', function () {
           log.innerHTML = '';
+        });
+
+        document.getElementById('debug-copy').addEventListener('click', function () {
+          // Reconstruct plain-text "<ts> <msg>" lines from the rendered <li>s.
+          var btn = document.getElementById('debug-copy');
+          var lines = [];
+          var lis = log.querySelectorAll('li');
+          for (var i = 0; i < lis.length; i++) {
+            // innerText collapses inline spans into the visible text and
+            // preserves the timestamp prefix.
+            lines.push((lis[i].innerText || lis[i].textContent || '').replace(/\s+/g, ' ').trim());
+          }
+          var text = lines.join('\n');
+          var done = function () {
+            var orig = btn.textContent;
+            btn.textContent = 'copied';
+            setTimeout(function () { btn.textContent = orig; }, 1200);
+          };
+          var fallback = function () {
+            // Older Android Chrome / non-secure context: textarea + execCommand.
+            var ta = document.createElement('textarea');
+            ta.value = text;
+            ta.setAttribute('readonly', '');
+            ta.style.position = 'fixed';
+            ta.style.opacity = '0';
+            document.body.appendChild(ta);
+            ta.select();
+            try { document.execCommand('copy'); done(); }
+            catch (e) { btn.textContent = 'failed'; }
+            ta.remove();
+          };
+          if (navigator.clipboard && navigator.clipboard.writeText) {
+            navigator.clipboard.writeText(text).then(done, fallback);
+          } else { fallback(); }
         });
 
         window.addEventListener('error', function (e) {
